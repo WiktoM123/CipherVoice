@@ -104,7 +104,8 @@ final class VoiceClient implements AutoCloseable {
         Thread.ofVirtual().name("udp-receiver").start(this::udpReceiveLoop);
         Thread.ofVirtual().name("udp-registration").start(this::registrationLoop);
 
-        audio = new OpusVoiceEngine(this::sendAudio, listener::onLocalAudioLevel);
+        audio = new OpusVoiceEngine(this::sendAudio, listener::onLocalAudioLevel,
+                listener::onParticipantAudioLevel);
         try {
             audio.start();
             listener.onStatus("Połączono — mikrofon i głośniki są aktywne");

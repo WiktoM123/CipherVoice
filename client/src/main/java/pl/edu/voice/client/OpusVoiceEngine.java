@@ -14,6 +14,7 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.function.DoubleConsumer;
 
@@ -27,6 +28,7 @@ final class OpusVoiceEngine implements AutoCloseable {
 
     private final Consumer<byte[]> packetConsumer;
     private final DoubleConsumer levelConsumer;
+    private final BiConsumer<UUID, Double> participantLevelConsumer;
     private final Map<UUID, OpusDecoder> decoders = new ConcurrentHashMap<>();
     private final AtomicBoolean running = new AtomicBoolean();
     private final AtomicBoolean muted = new AtomicBoolean();
@@ -34,9 +36,11 @@ final class OpusVoiceEngine implements AutoCloseable {
     private TargetDataLine microphone;
     private SourceDataLine speakers;
 
-    OpusVoiceEngine(Consumer<byte[]> packetConsumer, DoubleConsumer levelConsumer) {
+    OpusVoiceEngine(Consumer<byte[]> packetConsumer, DoubleConsumer levelConsumer,
+                    BiConsumer<UUID, Double> participantLevelConsumer) {
         this.packetConsumer = packetConsumer;
         this.levelConsumer = levelConsumer;
+        this.participantLevelConsumer = participantLevelConsumer;
     }
 
     void start() throws Exception {
@@ -53,7 +57,7 @@ final class OpusVoiceEngine implements AutoCloseable {
     }
 
     synchronized void play(UUID senderId, byte[] opus) {
-        if (!running.get() || speakers == null || deafened.get()) {
+        if (!running.get() || speakers == null) {
             return;
         }
         try {
@@ -66,6 +70,11 @@ final class OpusVoiceEngine implements AutoCloseable {
             });
             short[] pcm = new short[FRAME_SAMPLES * CHANNELS];
             int samples = decoder.decode(opus, 0, opus.length, pcm, 0, FRAME_SAMPLES, false);
+            participantLevelConsumer.accept(senderId,
+                    audioLevel(pcm, samples * CHANNELS));
+            if (deafened.get()) {
+                return;
+            }
             byte[] bytes = shortsToLittleEndian(pcm, samples * CHANNELS);
             speakers.write(bytes, 0, bytes.length);
         } catch (Exception ignored) {
@@ -91,7 +100,8 @@ final class OpusVoiceEngine implements AutoCloseable {
                 }
                 short[] pcm = littleEndianToShorts(pcmBytes);
                 if (++levelFrame % 3 == 0) {
-                    levelConsumer.accept(muted.get() || deafened.get() ? 0.0 : audioLevel(pcm));
+                    levelConsumer.accept(muted.get() || deafened.get()
+                            ? 0.0 : audioLevel(pcm, pcm.length));
                 }
                 if (muted.get() || deafened.get()) {
                     continue;
@@ -121,13 +131,17 @@ final class OpusVoiceEngine implements AutoCloseable {
         }
     }
 
-    private static double audioLevel(short[] pcm) {
+    private static double audioLevel(short[] pcm, int count) {
+        if (count <= 0) {
+            return 0.0;
+        }
         double sum = 0;
-        for (short sample : pcm) {
+        for (int i = 0; i < count; i++) {
+            short sample = pcm[i];
             double normalized = sample / 32768.0;
             sum += normalized * normalized;
         }
-        double rms = Math.sqrt(sum / pcm.length);
+        double rms = Math.sqrt(sum / count);
         return Math.min(1.0, rms * 4.0);
     }
 

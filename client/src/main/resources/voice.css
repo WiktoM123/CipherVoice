@@ -148,6 +148,12 @@
     -fx-border-radius: 11;
 }
 
+.participant-row.speaking {
+    -fx-background-color: rgba(48, 197, 132, 0.12);
+    -fx-border-color: rgba(70, 224, 160, 0.72);
+    -fx-effect: dropshadow(gaussian, rgba(51, 214, 148, 0.20), 14, 0.2, 0, 0);
+}
+
 .avatar {
     -fx-min-width: 42;
     -fx-min-height: 42;
@@ -158,8 +164,25 @@
 }
 
 .avatar-text { -fx-text-fill: white; -fx-font-weight: 800; -fx-font-size: 12px; }
+.avatar.speaking-avatar {
+    -fx-background-color: linear-gradient(to bottom right, #49e3a3, #1ea970);
+    -fx-effect: dropshadow(gaussian, rgba(62, 224, 157, 0.42), 12, 0.3, 0, 0);
+}
 .participant-name { -fx-text-fill: #edf2ff; -fx-font-weight: 700; }
 .online-label, .connected-label { -fx-text-fill: #55dda0; -fx-font-size: 11px; -fx-font-weight: 600; }
+.speaking-label { -fx-text-fill: #6ce8b2; -fx-font-size: 11px; -fx-font-weight: 700; }
+.speaking-dot {
+    -fx-min-width: 5;
+    -fx-min-height: 5;
+    -fx-max-width: 5;
+    -fx-max-height: 5;
+    -fx-background-color: rgba(83, 224, 164, 0.35);
+    -fx-background-radius: 3;
+}
+.speaking-dot.active {
+    -fx-background-color: #63efb4;
+    -fx-effect: dropshadow(gaussian, rgba(83, 224, 164, 0.75), 6, 0.25, 0, 0);
+}
 .disconnected-label { -fx-text-fill: #ff8d9d; -fx-font-size: 11px; }
 
 .control-bar {

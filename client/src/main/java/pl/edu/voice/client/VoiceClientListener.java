@@ -18,6 +18,9 @@ interface VoiceClientListener {
     default void onLocalAudioLevel(double level) {
     }
 
+    default void onParticipantAudioLevel(UUID participantId, double level) {
+    }
+
     default void onError(String message) {
     }
 

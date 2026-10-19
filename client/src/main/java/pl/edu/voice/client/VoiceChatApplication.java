@@ -1,5 +1,7 @@
 package pl.edu.voice.client;
 
+import javafx.animation.KeyFrame;
+import javafx.animation.Timeline;
 import javafx.application.Application;
 import javafx.application.Platform;
 import javafx.collections.FXCollections;
@@ -22,16 +24,22 @@ import javafx.scene.layout.Region;
 import javafx.scene.layout.StackPane;
 import javafx.scene.layout.VBox;
 import javafx.stage.Stage;
+import javafx.util.Duration;
 import pl.edu.voice.common.MemberInfo;
 
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Pattern;
 
 public class VoiceChatApplication extends Application {
     private static final Pattern SAFE_NAME = Pattern.compile("[\\p{L}\\p{N}_-]{1,40}");
+    private static final double SPEAKING_THRESHOLD = 0.04;
+    private static final long SPEAKING_HANGOVER_NANOS = 420_000_000L;
 
     private final ObservableList<MemberInfo> participants = FXCollections.observableArrayList();
+    private final Map<UUID, Long> speakingUntil = new ConcurrentHashMap<>();
     private Stage stage;
     private StackPane appRoot;
     private VoiceClient client;
@@ -44,6 +52,9 @@ public class VoiceChatApplication extends Application {
     private ProgressBar microphoneLevel;
     private ToggleButton muteButton;
     private ToggleButton deafenButton;
+    private Timeline speakingAnimation;
+    private int speakingPhase;
+    private boolean hadSpeakingParticipant;
     private volatile UUID selfId;
     private volatile UUID leaderId;
     private volatile int currentEpoch;
@@ -65,6 +76,7 @@ public class VoiceChatApplication extends Application {
         stage.setMinWidth(900);
         stage.setMinHeight(620);
         stage.setScene(scene);
+        startSpeakingAnimation();
         showLogin(null);
         stage.show();
     }
@@ -350,8 +362,37 @@ public class VoiceChatApplication extends Application {
         VoiceClient active = client;
         client = null;
         if (active != null) active.close();
+        speakingUntil.clear();
+        hadSpeakingParticipant = false;
         participants.clear();
         showLogin(null);
+    }
+
+    private void startSpeakingAnimation() {
+        speakingAnimation = new Timeline(new KeyFrame(Duration.millis(120), event -> {
+            long now = System.nanoTime();
+            speakingUntil.entrySet().removeIf(entry -> entry.getValue() <= now);
+            boolean hasSpeakingParticipant = !speakingUntil.isEmpty();
+            if ((hasSpeakingParticipant || hadSpeakingParticipant) && participantList != null) {
+                speakingPhase = (speakingPhase + 1) % 3;
+                participantList.refresh();
+            }
+            hadSpeakingParticipant = hasSpeakingParticipant;
+        }));
+        speakingAnimation.setCycleCount(Timeline.INDEFINITE);
+        speakingAnimation.play();
+    }
+
+    private void registerAudioLevel(UUID participantId, double level) {
+        if (participantId != null && level >= SPEAKING_THRESHOLD) {
+            speakingUntil.put(participantId,
+                    System.nanoTime() + SPEAKING_HANGOVER_NANOS);
+        }
+    }
+
+    private boolean isSpeaking(UUID participantId) {
+        Long until = speakingUntil.get(participantId);
+        return until != null && until > System.nanoTime();
     }
 
     private void publishMemberList() {
@@ -402,6 +443,7 @@ public class VoiceChatApplication extends Application {
 
     @Override
     public void stop() {
+        if (speakingAnimation != null) speakingAnimation.stop();
         if (client != null) client.close();
     }
 
@@ -442,9 +484,15 @@ public class VoiceChatApplication extends Application {
 
         @Override
         public void onLocalAudioLevel(double level) {
+            registerAudioLevel(selfId, level);
             Platform.runLater(() -> {
                 if (microphoneLevel != null) microphoneLevel.setProgress(level);
             });
+        }
+
+        @Override
+        public void onParticipantAudioLevel(UUID participantId, double level) {
+            registerAudioLevel(participantId, level);
         }
 
         @Override
@@ -490,6 +538,8 @@ public class VoiceChatApplication extends Application {
             initials.getStyleClass().add("avatar-text");
             StackPane avatar = new StackPane(initials);
             avatar.getStyleClass().add("avatar");
+            boolean speaking = isSpeaking(memberId);
+            if (speaking) avatar.getStyleClass().add("speaking-avatar");
 
             Label nickname = new Label(member.nickname());
             nickname.getStyleClass().add("participant-name");
@@ -501,11 +551,31 @@ public class VoiceChatApplication extends Application {
 
             Region fill = new Region();
             HBox.setHgrow(fill, Priority.ALWAYS);
-            Label online = new Label("●  online");
-            online.getStyleClass().add("online-label");
-            HBox row = new HBox(13, avatar, text, fill, online);
+            Node presence;
+            if (speaking) {
+                HBox dots = new HBox(3);
+                dots.setAlignment(Pos.CENTER);
+                dots.getStyleClass().add("speaking-dots");
+                for (int i = 0; i < 3; i++) {
+                    Region dot = new Region();
+                    dot.getStyleClass().add("speaking-dot");
+                    if (i == speakingPhase) dot.getStyleClass().add("active");
+                    dots.getChildren().add(dot);
+                }
+                Label speakingLabel = new Label("mówi");
+                speakingLabel.getStyleClass().add("speaking-label");
+                HBox speakingIndicator = new HBox(7, dots, speakingLabel);
+                speakingIndicator.setAlignment(Pos.CENTER);
+                presence = speakingIndicator;
+            } else {
+                Label online = new Label("●  online");
+                online.getStyleClass().add("online-label");
+                presence = online;
+            }
+            HBox row = new HBox(13, avatar, text, fill, presence);
             row.setAlignment(Pos.CENTER_LEFT);
             row.getStyleClass().add("participant-row");
+            if (speaking) row.getStyleClass().add("speaking");
             setGraphic(row);
         }
     }
