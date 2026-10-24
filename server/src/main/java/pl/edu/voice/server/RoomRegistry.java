@@ -2,28 +2,28 @@ package pl.edu.voice.server;
 
 import org.springframework.stereotype.Component;
 import pl.edu.voice.common.MemberInfo;
+import pl.edu.voice.common.NameRules;
+import pl.edu.voice.common.Protocol;
+import pl.edu.voice.common.PublicKeys;
 
+import java.security.GeneralSecurityException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.regex.Pattern;
 
 @Component
 public class RoomRegistry {
-    private static final Pattern SAFE_NAME = Pattern.compile("[\\p{L}\\p{N}_-]{1,40}");
-
     private final Map<String, Room> rooms = new LinkedHashMap<>();
     private final Map<UUID, ClientSession> clients = new LinkedHashMap<>();
 
-    synchronized Change join(ClientSession session, String roomName, String nickname, String publicKey) {
-        validateName("Nazwa pokoju", roomName);
-        validateName("Nickname", nickname);
-        if (publicKey == null || publicKey.length() > 256) {
-            throw new IllegalArgumentException("Nieprawidłowy klucz publiczny");
-        }
+    synchronized Change join(ClientSession session, String roomName, String nickname,
+                            String publicKey) {
+        NameRules.requireValid("Nazwa pokoju", roomName);
+        NameRules.requireValid("Nickname", nickname);
+        validatePublicKey(publicKey);
 
         Room room = rooms.computeIfAbsent(roomName, Room::new);
         boolean duplicate = room.clients.values().stream()
@@ -70,6 +70,7 @@ public class RoomRegistry {
     synchronized boolean mayDistribute(ClientSession sender, UUID target, int epoch) {
         Room room = rooms.get(sender.room);
         return room != null
+                && target != null
                 && room.epoch == epoch
                 && sender.id.equals(room.leaderId())
                 && room.clients.containsKey(target);
@@ -80,6 +81,11 @@ public class RoomRegistry {
         return room != null && room.epoch == epoch && room.clients.containsKey(sender.id);
     }
 
+    synchronized boolean isCurrentRoomEpoch(String roomName, int epoch) {
+        Room room = rooms.get(roomName);
+        return room != null && room.epoch == epoch;
+    }
+
     synchronized List<ClientSession> peers(ClientSession sender) {
         Room room = rooms.get(sender.room);
         if (room == null) {
@@ -88,6 +94,11 @@ public class RoomRegistry {
         return room.clients.values().stream()
                 .filter(client -> !client.id.equals(sender.id))
                 .toList();
+    }
+
+    /** Snapshot used to close all control sockets during server shutdown. */
+    synchronized List<ClientSession> allSessions() {
+        return List.copyOf(clients.values());
     }
 
     public synchronized int roomCount() {
@@ -107,9 +118,14 @@ public class RoomRegistry {
         return new Change(room.name, room.epoch, room.leaderId(), members, recipients);
     }
 
-    private static void validateName(String label, String value) {
-        if (value == null || !SAFE_NAME.matcher(value).matches()) {
-            throw new IllegalArgumentException(label + " może mieć 1–40 liter, cyfr, _ lub -");
+    private static void validatePublicKey(String publicKey) {
+        if (publicKey != null && publicKey.length() > Protocol.MAX_PUBLIC_KEY_CHARS) {
+            throw new IllegalArgumentException("Nieprawidłowy klucz publiczny");
+        }
+        try {
+            PublicKeys.decode(publicKey);
+        } catch (GeneralSecurityException exception) {
+            throw new IllegalArgumentException("Nieprawidłowy klucz publiczny X25519");
         }
     }
 
@@ -131,4 +147,3 @@ public class RoomRegistry {
         }
     }
 }
-

@@ -19,10 +19,13 @@ otrzymuje grupowego klucza AES ani dźwięku w postaci jawnej.
 - uzgadnianie kluczy przy użyciu X25519 i HKDF-SHA-256;
 - automatyczna zmiana klucza po dołączeniu lub opuszczeniu pokoju;
 - ochrona przed ponownym odtworzeniem starego pakietu;
-- wyciszanie mikrofonu i głośników;
+- niezależne wyciszanie mikrofonu i dźwięku wychodzącego;
+- miksowanie jednoczesnych strumieni wielu mówców;
+- krótkie, ograniczone kolejki audio chroniące przed narastaniem opóźnienia;
 - wskaźnik osoby mówiącej: podświetlenie, napis i animowane kropki;
+- automatyczny powrót do ekranu logowania po utracie połączenia;
 - endpoint HTTP pokazujący stan serwera;
-- testy kryptografii.
+- testy jednostkowe i integracyjne całego protokołu.
 
 ## Technologie
 
@@ -140,16 +143,26 @@ przed użyciem koperty w innym pokoju, innej epoce lub dla innej osoby.
 6. Klient wysyła datagram UDP do serwera.
 7. Serwer sprawdza identyfikator, `senderTag`, adres UDP i epokę.
 8. Serwer przesyła ten sam zaszyfrowany datagram pozostałym osobom w pokoju.
-9. Odbiorca sprawdza epokę i numer sekwencyjny, odszyfrowuje AES-GCM, dekoduje
-   Opus i odtwarza PCM w głośnikach.
-10. Poziom odszyfrowanego PCM steruje wskaźnikiem aktywnego mówcy w GUI.
+9. Odbiorca sprawdza epokę i numer sekwencyjny, odszyfrowuje AES-GCM i dekoduje
+   Opus.
+10. Odszyfrowana ramka PCM trafia do krótkiej kolejki danego mówcy (maksymalnie
+    trzy ramki). Przy przepełnieniu najstarsza ramka jest odrzucana, więc
+    opóźnienie nie rośnie w nieskończoność.
+11. Wątek odtwarzania co 20 ms pobiera po jednej ramce od każdego aktywnego
+    mówcy, miksuje je z nasyceniem do zakresu 16 bitów i zapisuje do głośników.
+12. Poziom odszyfrowanego PCM steruje wskaźnikiem aktywnego mówcy w GUI.
+
+Wyciszenie mikrofonu zatrzymuje tylko wysyłanie nowych ramek. Wyciszenie
+dźwięku wychodzącego czyści kolejki odtwarzania i nie zmienia stanu mikrofonu.
 
 Serwer nie wykonuje kroku odszyfrowania ani dekodowania Opus.
 
 ## Format pakietu audio UDP
 
 Nagłówek jest uwierzytelniany przez AES-GCM jako AAD. Nie jest tajny, ale jego
-podmiana powoduje odrzucenie pakietu.
+podmiana — w tym zmiana długości szyfrogramu — powoduje odrzucenie pakietu.
+Bieżąca wersja protokołu to `2`. Wersja 2 nie jest kompatybilna z poprzednią
+wersją protokołu — klienta i serwer należy wdrożyć razem.
 
 | Pole | Rozmiar | Znaczenie |
 |---|---:|---|
@@ -163,8 +176,9 @@ podmiana powoduje odrzucenie pakietu.
 | `ciphertext` | zmienny | Opus zaszyfrowany wraz z tagiem GCM |
 
 Nonce AES-GCM ma 12 bajtów i składa się z `senderTag` (4 B) oraz `sequence`
-(8 B). Każdy nadawca ma własny `senderTag`, a licznik jest zerowany przy zmianie
-epoki, kiedy używany jest już nowy klucz.
+(8 B). Każdy nadawca ma własny `senderTag`, a licznik `sequence` jest monotoniczny
+przez cały czas życia sesji i **nie jest zerowany przy zmianie epoki**. Dzięki
+temu ten sam nonce nigdy nie zostaje użyty z dwoma różnymi kluczami AES-GCM.
 
 ## Komunikaty kanału sterującego
 
@@ -189,6 +203,9 @@ Każdy komunikat TCP jest jedną linią JSON.
 | `MessageType.java` | lista typów komunikatów TCP |
 | `WireMessage.java` | obiekt wiadomości JSON przesyłanej przez TCP |
 | `MemberInfo.java` | publiczne dane uczestnika: ID, nickname, klucz publiczny i tag |
+| `JsonLines.java` | bezpieczny odczyt i zapis linii JSON z limitem rozmiaru |
+| `NameRules.java` | wspólna walidacja nazwy pokoju i nickname |
+| `PublicKeys.java` | kodowanie i walidacja kluczy publicznych X25519 |
 
 ### Moduł `server`
 
@@ -215,7 +232,7 @@ Każdy komunikat TCP jest jedną linią JSON.
 | `OpusVoiceEngine.java` | mikrofon, głośniki, kodowanie i dekodowanie Opus, pomiar głośności |
 | `CryptoSupport.java` | X25519, HKDF-SHA-256, AES-GCM i generowanie kluczy |
 | `AudioPacketCodec.java` | budowanie, szyfrowanie, odczyt i odszyfrowanie datagramów |
-| `CryptoSupportTest.java` | test kopert klucza oraz wykrywania modyfikacji szyfrogramu |
+| `CryptoSupportTest.java` | testy X25519, HKDF, kopert klucza, AES-GCM i formatu pakietu |
 
 Najczęstsze miejsca zmian:
 
@@ -284,6 +301,20 @@ Uruchomienie testów bez pakowania:
 ```powershell
 .\mvnw.cmd test
 ```
+
+### Testy automatyczne
+
+Projekt zawiera 28 testów:
+
+| Moduł | Zakres |
+|---|---|
+| `common` | walidacja nazw, limit linii JSON, kodowanie kluczy X25519 |
+| `client` | HKDF, koperty klucza, nonce, uwierzytelnianie nagłówka i odrzucanie błędnych pakietów |
+| `server` | pokoje, lider, epoki, uprawnienia do dystrybucji klucza, przekaźnik UDP |
+| `server` (integracja) | prawdziwy serwer TCP/UDP i klienci z wyłączonym audio: wspólny klucz epoki, rotacja po dołączeniu/opuszczeniu oraz równoczesne dołączanie pięciu osób |
+
+Test integracyjny nie otwiera mikrofonu ani głośników. Odsłuch na żywo wymaga
+fizycznych urządzeń audio i nie jest częścią testów automatycznych.
 
 ## Uruchomienie na jednym komputerze
 
@@ -489,8 +520,7 @@ uwierzytelnienia uczestników.
 ## Obecne ograniczenia i dalszy rozwój
 
 - brak wyboru urządzenia wejściowego i wyjściowego w GUI;
-- brak bufora jitter i adaptacyjnego wyrównywania opóźnień;
-- brak prawdziwego miksowania kilku jednoczesnych strumieni PCM;
+- brak adaptacyjnego bufora jitter; kolejka odtwarzania ma stały rozmiar;
 - brak automatycznego odnajdywania serwera w LAN;
 - brak NAT traversal; połączenie przez internet wymaga obecnie dostępnego serwera;
 - brak kont, ról, haseł do pokojów i list kontroli dostępu;
@@ -500,13 +530,12 @@ uwierzytelnienia uczestników.
 
 Naturalna kolejność dalszych prac:
 
-1. bufor jitter i miksowanie wielu rozmówców;
-2. wybór mikrofonu oraz głośników;
+1. adaptacyjny bufor jitter oraz lepsza kompensacja utraty pakietów;
+2. wybór mikrofonu i głośników;
 3. SAS lub QR do weryfikacji kluczy;
-4. testy integracyjne klient–serwer;
-5. serwer dostępny przez internet;
-6. instalator Windows przez `jpackage`;
-7. pomiary opóźnienia, strat pakietów i jakości dźwięku do pracy inżynierskiej.
+4. serwer dostępny przez internet;
+5. instalator Windows przez `jpackage`;
+6. pomiary opóźnienia, strat pakietów i jakości dźwięku do pracy inżynierskiej.
 
 ## Uruchamianie i zatrzymywanie — skrót
 

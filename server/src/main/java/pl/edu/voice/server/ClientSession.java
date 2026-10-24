@@ -1,6 +1,7 @@
 package pl.edu.voice.server;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import pl.edu.voice.common.JsonLines;
 import pl.edu.voice.common.WireMessage;
 
 import java.io.BufferedWriter;
@@ -32,9 +33,14 @@ final class ClientSession {
     }
 
     synchronized void send(WireMessage message) throws IOException {
-        writer.write(mapper.writeValueAsString(message));
-        writer.newLine();
-        writer.flush();
+        JsonLines.write(writer, mapper.writeValueAsString(message));
+    }
+
+    void closeSocket() {
+        try {
+            socket.close();
+        } catch (IOException ignored) {
+            // Already closed.
+        }
     }
 }
-

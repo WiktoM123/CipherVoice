@@ -1,6 +1,7 @@
 package pl.edu.voice.client;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import pl.edu.voice.common.JsonLines;
 import pl.edu.voice.common.MemberInfo;
 import pl.edu.voice.common.MessageType;
 import pl.edu.voice.common.Protocol;
@@ -16,14 +17,21 @@ import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
-import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.security.GeneralSecurityException;
 import java.security.KeyPair;
 import java.security.PublicKey;
+import java.util.ArrayList;
 import java.util.Base64;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
@@ -32,42 +40,56 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 final class VoiceClient implements AutoCloseable {
+    private static final System.Logger log = System.getLogger(VoiceClient.class.getName());
+    private static final int MAX_PENDING_ENVELOPES = 16;
+
     private final String host;
     private final int controlPort;
     private final int udpPort;
     private final String room;
     private final String nickname;
+    private final boolean audioEnabled;
     private final VoiceClientListener listener;
     private final ObjectMapper mapper = new ObjectMapper();
     private final KeyPair identity;
     private final Map<UUID, MemberInfo> members = new ConcurrentHashMap<>();
     private final Map<UUID, Long> receivedSequences = new ConcurrentHashMap<>();
+    private final Map<Integer, WireMessage> pendingEnvelopes = new LinkedHashMap<>();
     private final AtomicBoolean running = new AtomicBoolean();
+    private final AtomicBoolean resourcesClosed = new AtomicBoolean();
+    private final AtomicBoolean userClosing = new AtomicBoolean();
+    private final AtomicBoolean started = new AtomicBoolean();
+    private final AtomicBoolean disconnectNotified = new AtomicBoolean();
     private final AtomicLong sequence = new AtomicLong();
     private final CountDownLatch welcomed = new CountDownLatch(1);
     private final Object stateLock = new Object();
-    private final AtomicBoolean disconnectNotified = new AtomicBoolean();
 
     private Socket controlSocket;
     private BufferedWriter controlWriter;
     private DatagramSocket udpSocket;
     private InetSocketAddress relayAddress;
-    private OpusVoiceEngine audio;
+    private volatile OpusVoiceEngine audio;
     private volatile UUID clientId;
     private volatile UUID leaderId;
     private volatile int senderTag;
     private volatile int epoch;
     private volatile byte[] relayToken;
-    private volatile SecretKeySpec groupKey;
+    private volatile AudioKey audioKey;
+    private volatile String lastServerError;
 
     VoiceClient(String host, int controlPort, int udpPort, String room, String nickname,
-                VoiceClientListener listener)
-            throws Exception {
+                VoiceClientListener listener) throws Exception {
+        this(host, controlPort, udpPort, room, nickname, listener, true);
+    }
+
+    VoiceClient(String host, int controlPort, int udpPort, String room, String nickname,
+                VoiceClientListener listener, boolean audioEnabled) throws Exception {
         this.host = host;
         this.controlPort = controlPort;
         this.udpPort = udpPort;
         this.room = room;
         this.nickname = nickname;
+        this.audioEnabled = audioEnabled;
         this.listener = listener == null ? new VoiceClientListener() { } : listener;
         this.identity = CryptoSupport.newIdentityKeyPair();
     }
@@ -77,6 +99,7 @@ final class VoiceClient implements AutoCloseable {
         controlSocket = new Socket();
         controlSocket.connect(new InetSocketAddress(host, controlPort), 5_000);
         controlSocket.setTcpNoDelay(true);
+        controlSocket.setKeepAlive(true);
         controlWriter = new BufferedWriter(new OutputStreamWriter(
                 controlSocket.getOutputStream(), StandardCharsets.UTF_8));
         BufferedReader reader = new BufferedReader(new InputStreamReader(
@@ -94,160 +117,348 @@ final class VoiceClient implements AutoCloseable {
             throw new IOException("Serwer nie odpowiedział na żądanie dołączenia");
         }
         if (!running.get() || clientId == null) {
-            throw new IOException("Nie udało się dołączyć do pokoju");
+            throw new IOException(lastServerError == null
+                    ? "Nie udało się dołączyć do pokoju" : lastServerError);
         }
 
         udpSocket = new DatagramSocket();
-        relayAddress = new InetSocketAddress(InetAddress.getByName(host), udpPort);
+        udpSocket.setReceiveBufferSize(64 * 1024);
+        relayAddress = new InetSocketAddress(controlSocket.getInetAddress(), udpPort);
         udpSocket.connect(relayAddress);
+        if (!running.get()) {
+            throw new IOException("Połączenie zostało przerwane podczas dołączania");
+        }
         registerUdp();
         Thread.ofVirtual().name("udp-receiver").start(this::udpReceiveLoop);
         Thread.ofVirtual().name("udp-registration").start(this::registrationLoop);
 
-        audio = new OpusVoiceEngine(this::sendAudio, listener::onLocalAudioLevel,
-                listener::onParticipantAudioLevel);
-        try {
-            audio.start();
-            listener.onStatus("Połączono — mikrofon i głośniki są aktywne");
-        } catch (Exception exception) {
-            listener.onError("Połączono, ale nie można uruchomić audio: "
-                    + exception.getMessage());
+        if (audioEnabled) {
+            OpusVoiceEngine engine = new OpusVoiceEngine(this::sendAudio,
+                    listener::onLocalAudioLevel, listener::onParticipantAudioLevel);
+            audio = engine;
+            try {
+                engine.start();
+                listener.onStatus("Połączono — mikrofon i głośniki są aktywne");
+            } catch (Exception exception) {
+                listener.onError("Połączono, ale nie można uruchomić audio: "
+                        + exception.getMessage());
+            }
+        } else {
+            listener.onStatus("Połączono (audio wyłączone)");
         }
+
+        if (!running.get()) {
+            throw new IOException("Połączenie zostało przerwane podczas uruchamiania audio");
+        }
+        started.set(true);
     }
 
     private void controlLoop(BufferedReader reader) {
         try {
             String line;
-            while (running.get() && (line = reader.readLine()) != null) {
-                handleControl(mapper.readValue(line, WireMessage.class));
+            while (running.get()
+                    && (line = JsonLines.read(reader, Protocol.MAX_CONTROL_LINE_CHARS)) != null) {
+                try {
+                    handleControl(mapper.readValue(line, WireMessage.class));
+                } catch (Exception exception) {
+                    lastServerError = "Nieprawidłowy komunikat serwera: "
+                            + messageOf(exception);
+                    if (!started.get()) {
+                        running.set(false);
+                    }
+                    welcomed.countDown();
+                    listener.onError(lastServerError);
+                }
             }
         } catch (Exception exception) {
-            if (running.get()) {
-                listener.onError("Utracono połączenie sterujące: " + exception.getMessage());
+            if (running.get() && !userClosing.get()) {
+                lastServerError = "Utracono połączenie sterujące: " + messageOf(exception);
+                listener.onError(lastServerError);
             }
         } finally {
-            running.set(false);
+            boolean notify = !userClosing.get() && started.get();
+            releaseResources();
             welcomed.countDown();
-            notifyDisconnected("Połączenie z serwerem zostało zakończone");
+            if (notify) {
+                notifyDisconnected("Połączenie z serwerem zostało zakończone");
+            }
         }
     }
 
     private void handleControl(WireMessage message) throws Exception {
-        if (message.type == MessageType.ERROR) {
-            listener.onError("Serwer odrzucił żądanie: " + message.error);
-            running.set(false);
-            welcomed.countDown();
-            return;
+        if (message == null || message.type == null) {
+            throw new IllegalArgumentException("Brak typu komunikatu");
         }
-        if (message.type == MessageType.WELCOME) {
-            clientId = UUID.fromString(message.clientId);
-            senderTag = message.senderTag;
-            relayToken = Base64.getDecoder().decode(message.relayToken);
-            updateRoomState(message);
-            listener.onStatus("Dołączono do pokoju " + room);
-            welcomed.countDown();
-        } else if (message.type == MessageType.ROOM_STATE) {
-            updateRoomState(message);
-        } else if (message.type == MessageType.REKEY_REQUEST) {
-            updateRoomState(message);
-            if (clientId != null && clientId.equals(leaderId)) {
-                rotateAndDistributeKey(message.epoch);
+        switch (message.type) {
+            case ERROR -> {
+                lastServerError = "Serwer odrzucił żądanie: "
+                        + (message.error == null ? "nieznany błąd" : message.error);
+                listener.onError(lastServerError);
+                running.set(false);
+                welcomed.countDown();
             }
-        } else if (message.type == MessageType.KEY_DISTRIBUTION) {
-            acceptDistributedKey(message);
+            case WELCOME -> handleWelcome(message);
+            case ROOM_STATE, REKEY_REQUEST -> refreshRoomState(message);
+            case KEY_DISTRIBUTION -> acceptDistributedKey(message);
+            case JOIN -> throw new IllegalArgumentException("Nieoczekiwany komunikat JOIN");
         }
-        if (message.type == MessageType.WELCOME || message.type == MessageType.ROOM_STATE
-                || message.type == MessageType.REKEY_REQUEST) {
-            publishRoomState();
+    }
+
+    private void refreshRoomState(WireMessage message) {
+        updateRoomState(message);
+        applyPendingEnvelope();
+        ensureLeaderKey();
+        publishRoomState();
+    }
+
+    private void handleWelcome(WireMessage message) throws IOException {
+        if (message.clientId == null || message.senderTag == null
+                || message.relayToken == null || message.epoch == null) {
+            throw new IOException("Niepełne dane powitalne serwera");
         }
+        UUID newClientId;
+        try {
+            newClientId = UUID.fromString(message.clientId);
+        } catch (IllegalArgumentException exception) {
+            throw new IOException("Nieprawidłowy identyfikator klienta", exception);
+        }
+        byte[] token;
+        try {
+            token = Base64.getDecoder().decode(message.relayToken);
+        } catch (IllegalArgumentException exception) {
+            throw new IOException("Nieprawidłowy token UDP", exception);
+        }
+        if (token.length != Protocol.RELAY_TOKEN_BYTES) {
+            throw new IOException("Nieprawidłowa długość tokenu UDP");
+        }
+
+        clientId = newClientId;
+        senderTag = message.senderTag;
+        relayToken = token;
+        updateRoomState(message);
+        applyPendingEnvelope();
+        ensureLeaderKey();
+        publishRoomState();
+        listener.onStatus("Dołączono do pokoju " + room);
+        welcomed.countDown();
     }
 
     private void updateRoomState(WireMessage message) {
+        int newEpoch = message.epoch == null ? epoch : message.epoch;
+        if (newEpoch < epoch) {
+            return; // late broadcast from an older membership change
+        }
+
+        UUID newLeader = parseOptionalUuid(message.leaderId, "leaderId");
+        Map<UUID, MemberInfo> newMembers = new HashMap<>();
+        if (message.members != null) {
+            for (MemberInfo member : message.members) {
+                if (member == null || member.clientId() == null) {
+                    throw new IllegalArgumentException("Niepełne dane uczestnika");
+                }
+                UUID memberId = parseUuid(member.clientId(), "clientId uczestnika");
+                newMembers.put(memberId, member);
+            }
+        }
+
+        Set<UUID> removed = new HashSet<>();
         synchronized (stateLock) {
-            int newEpoch = message.epoch == null ? epoch : message.epoch;
-            if (newEpoch != epoch) {
-                groupKey = null;
-                sequence.set(0);
+            if (newEpoch < epoch) {
+                return;
+            }
+            if (newEpoch > epoch) {
+                epoch = newEpoch;
+                audioKey = null;
                 receivedSequences.clear();
             }
-            epoch = newEpoch;
-            leaderId = message.leaderId == null ? null : UUID.fromString(message.leaderId);
+            leaderId = newLeader;
+            removed.addAll(members.keySet());
             members.clear();
-            if (message.members != null) {
-                for (MemberInfo member : message.members) {
-                    members.put(UUID.fromString(member.clientId()), member);
-                }
-            }
+            members.putAll(newMembers);
+            removed.removeAll(newMembers.keySet());
+        }
+        OpusVoiceEngine engine = audio;
+        if (engine != null) {
+            removed.forEach(engine::removeParticipant);
         }
     }
 
-    private void rotateAndDistributeKey(int requestedEpoch) throws Exception {
+    private void rotateAndDistributeKey(int requestedEpoch) {
         SecretKeySpec newKey;
         Map<UUID, MemberInfo> roster;
         synchronized (stateLock) {
-            if (requestedEpoch != epoch || !clientId.equals(leaderId)) {
+            if (requestedEpoch != epoch || clientId == null || !clientId.equals(leaderId)) {
                 return;
             }
+            AudioKey current = audioKey;
+            if (current != null && current.epoch() == requestedEpoch) {
+                return; // duplicate REKEY_REQUEST for an epoch that already has a key
+            }
             newKey = CryptoSupport.newGroupKey();
-            groupKey = newKey;
-            sequence.set(0);
+            audioKey = new AudioKey(requestedEpoch, newKey);
             roster = Map.copyOf(members);
         }
+
+        List<String> failed = new ArrayList<>();
         for (Map.Entry<UUID, MemberInfo> entry : roster.entrySet()) {
             UUID targetId = entry.getKey();
             if (targetId.equals(clientId)) {
                 continue;
             }
-            PublicKey targetKey = CryptoSupport.decodePublicKey(entry.getValue().publicKey());
-            String context = keyContext(requestedEpoch, clientId, targetId);
-            CryptoSupport.WrappedKey wrapped = CryptoSupport.wrapGroupKey(
-                    newKey, identity.getPrivate(), targetKey, context);
-            WireMessage distribution = WireMessage.of(MessageType.KEY_DISTRIBUTION);
-            distribution.epoch = requestedEpoch;
-            distribution.targetId = targetId.toString();
-            distribution.wrapNonce = wrapped.nonce();
-            distribution.wrappedKey = wrapped.ciphertext();
-            sendControl(distribution);
+            try {
+                PublicKey targetKey = CryptoSupport.decodePublicKey(
+                        entry.getValue().publicKey());
+                String context = keyContext(requestedEpoch, clientId, targetId);
+                CryptoSupport.WrappedKey wrapped = CryptoSupport.wrapGroupKey(
+                        newKey, identity.getPrivate(), targetKey, context);
+                WireMessage distribution = WireMessage.of(MessageType.KEY_DISTRIBUTION);
+                distribution.epoch = requestedEpoch;
+                distribution.targetId = targetId.toString();
+                distribution.wrapNonce = wrapped.nonce();
+                distribution.wrappedKey = wrapped.ciphertext();
+                sendControl(distribution);
+            } catch (Exception exception) {
+                failed.add(entry.getValue().nickname() == null
+                        ? targetId.toString() : entry.getValue().nickname());
+            }
         }
         listener.onEncryptionChanged(true, requestedEpoch);
+        if (!failed.isEmpty()) {
+            listener.onError("Nie udało się przekazać klucza do: "
+                    + String.join(", ", failed));
+        }
     }
 
-    private void acceptDistributedKey(WireMessage message) throws Exception {
-        UUID senderId = UUID.fromString(message.clientId);
-        UUID targetId = UUID.fromString(message.targetId);
+    private void acceptDistributedKey(WireMessage message) {
+        if (message.clientId == null || message.targetId == null || message.epoch == null
+                || message.wrapNonce == null || message.wrappedKey == null) {
+            listener.onError("Serwer przesłał niepełną kopertę klucza");
+            return;
+        }
+        if (tryAcceptKey(message)) {
+            return;
+        }
+        rememberPendingEnvelope(message);
+    }
+
+    private boolean tryAcceptKey(WireMessage message) {
+        UUID senderId;
+        UUID targetId;
+        try {
+            senderId = parseUuid(message.clientId, "clientId nadawcy klucza");
+            targetId = parseUuid(message.targetId, "targetId koperty");
+        } catch (IllegalArgumentException exception) {
+            listener.onError("Nieprawidłowa koperta klucza: " + messageOf(exception));
+            return false;
+        }
+
+        SecretKeySpec acceptedKey = null;
+        String failure = null;
+        int acceptedEpoch;
         synchronized (stateLock) {
-            if (!targetId.equals(clientId) || message.epoch == null || message.epoch != epoch
-                    || !senderId.equals(leaderId)) {
-                return;
+            acceptedEpoch = epoch;
+            if (clientId == null || !targetId.equals(clientId)
+                    || message.epoch != acceptedEpoch
+                    || !senderId.equals(leaderId) || senderId.equals(clientId)) {
+                return false;
             }
             MemberInfo sender = members.get(senderId);
             if (sender == null) {
+                return false;
+            }
+            try {
+                PublicKey senderKey = CryptoSupport.decodePublicKey(sender.publicKey());
+                String context = keyContext(acceptedEpoch, senderId, clientId);
+                acceptedKey = CryptoSupport.unwrapGroupKey(
+                        new CryptoSupport.WrappedKey(message.wrapNonce, message.wrappedKey),
+                        identity.getPrivate(), senderKey, context);
+            } catch (GeneralSecurityException | IllegalArgumentException exception) {
+                failure = messageOf(exception);
+            }
+            if (acceptedKey != null) {
+                audioKey = new AudioKey(acceptedEpoch, acceptedKey);
+            }
+        }
+        if (failure != null) {
+            listener.onError("Nie udało się odszyfrować klucza grupowego: " + failure);
+            return false;
+        }
+        if (acceptedKey == null) {
+            return false;
+        }
+        listener.onEncryptionChanged(true, acceptedEpoch);
+        return true;
+    }
+
+    /**
+     * An envelope can arrive before this client processed the room state that
+     * announces its epoch, for example during two concurrent membership
+     * changes. Such an envelope is kept until the matching room state arrives.
+     */
+    private void rememberPendingEnvelope(WireMessage message) {
+        synchronized (stateLock) {
+            if (message.epoch == null || message.targetId == null || message.epoch < epoch) {
                 return;
             }
-            PublicKey senderKey = CryptoSupport.decodePublicKey(sender.publicKey());
-            String context = keyContext(epoch, senderId, clientId);
-            groupKey = CryptoSupport.unwrapGroupKey(
-                    new CryptoSupport.WrappedKey(message.wrapNonce, message.wrappedKey),
-                    identity.getPrivate(), senderKey, context);
-            sequence.set(0);
+            if (clientId != null) {
+                if (!message.targetId.equals(clientId.toString()) || message.epoch <= epoch) {
+                    return;
+                }
+            }
+            pendingEnvelopes.put(message.epoch, message);
+            while (pendingEnvelopes.size() > MAX_PENDING_ENVELOPES) {
+                Integer oldest = pendingEnvelopes.keySet().iterator().next();
+                pendingEnvelopes.remove(oldest);
+            }
         }
-        listener.onEncryptionChanged(true, epoch);
+    }
+
+    private void applyPendingEnvelope() {
+        WireMessage candidate;
+        synchronized (stateLock) {
+            if (clientId == null) {
+                return; // wait for WELCOME, which carries our target id
+            }
+            pendingEnvelopes.keySet().removeIf(pendingEpoch -> pendingEpoch < epoch);
+            candidate = pendingEnvelopes.remove(epoch);
+        }
+        if (candidate != null) {
+            tryAcceptKey(candidate);
+        }
+    }
+
+    /**
+     * When a membership change makes this client the leader, nobody else is
+     * going to generate the new group key. This also covers a REKEY_REQUEST
+     * that arrived before the room state updating the leader.
+     */
+    private void ensureLeaderKey() {
+        int requestedEpoch;
+        synchronized (stateLock) {
+            if (clientId == null || !clientId.equals(leaderId)
+                    || (audioKey != null && audioKey.epoch() == epoch)) {
+                return;
+            }
+            requestedEpoch = epoch;
+        }
+        rotateAndDistributeKey(requestedEpoch);
     }
 
     private void sendAudio(byte[] opus) {
         try {
-            SecretKeySpec key = groupKey;
+            AudioKey currentKey = audioKey;
             DatagramSocket socket = udpSocket;
-            if (!running.get() || key == null || socket == null || clientId == null) {
+            UUID sender = clientId;
+            if (!running.get() || currentKey == null || socket == null
+                    || sender == null || relayAddress == null || opus == null) {
                 return;
             }
-            int packetEpoch = epoch;
             long packetSequence = sequence.getAndIncrement();
-            byte[] encrypted = AudioPacketCodec.encrypt(clientId, packetEpoch, senderTag,
-                    packetSequence, opus, key);
+            byte[] encrypted = AudioPacketCodec.encrypt(sender, currentKey.epoch(), senderTag,
+                    packetSequence, opus, currentKey.key());
             socket.send(new DatagramPacket(encrypted, encrypted.length, relayAddress));
         } catch (Exception exception) {
-            // Pojedynczy utracony datagram nie powinien przerywać rozmowy.
+            // A single lost datagram must not interrupt the conversation.
         }
     }
 
@@ -258,25 +469,29 @@ final class VoiceClient implements AutoCloseable {
                 DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
                 udpSocket.receive(packet);
                 byte[] data = java.util.Arrays.copyOf(packet.getData(), packet.getLength());
-                SecretKeySpec key = groupKey;
-                if (key == null || AudioPacketCodec.peekEpoch(data) != epoch) {
+
+                AudioKey currentKey = audioKey;
+                if (currentKey == null || AudioPacketCodec.peekEpoch(data) != currentKey.epoch()
+                        || audioKey != currentKey) {
                     continue;
                 }
-                AudioPacketCodec.DecodedPacket decoded = AudioPacketCodec.decrypt(data, key);
+                AudioPacketCodec.DecodedPacket decoded = AudioPacketCodec.decrypt(
+                        data, currentKey.key());
                 MemberInfo member = members.get(decoded.senderId());
                 if (member == null || member.senderTag() != decoded.senderTag()) {
                     continue;
                 }
-                Long previous = receivedSequences.put(decoded.senderId(), decoded.sequence());
+                Long previous = receivedSequences.get(decoded.senderId());
                 if (previous != null && decoded.sequence() <= previous) {
-                    receivedSequences.put(decoded.senderId(), previous);
                     continue;
                 }
-                if (audio != null) {
-                    audio.play(decoded.senderId(), decoded.opus());
+                receivedSequences.put(decoded.senderId(), decoded.sequence());
+                OpusVoiceEngine engine = audio;
+                if (engine != null) {
+                    engine.play(decoded.senderId(), decoded.opus());
                 }
             } catch (Exception exception) {
-                // Nieprawidłowy lub spóźniony datagram jest pomijany.
+                // Invalid, replayed or late datagrams are simply dropped.
             }
         }
     }
@@ -289,45 +504,62 @@ final class VoiceClient implements AutoCloseable {
             } catch (InterruptedException exception) {
                 Thread.currentThread().interrupt();
                 return;
-            } catch (IOException ignored) {
-                // Następna próba nastąpi za trzy sekundy.
+            } catch (IOException exception) {
+                // Try again on the next iteration.
             }
         }
     }
 
     private void registerUdp() throws IOException {
-        if (udpSocket == null || clientId == null || relayToken == null) {
+        DatagramSocket socket = udpSocket;
+        UUID id = clientId;
+        byte[] token = relayToken;
+        InetSocketAddress relay = relayAddress;
+        if (socket == null || id == null || token == null || relay == null) {
             return;
         }
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
         try (DataOutputStream output = new DataOutputStream(bytes)) {
             output.writeInt(Protocol.REGISTER_MAGIC);
             output.writeByte(Protocol.VERSION);
-            output.writeLong(clientId.getMostSignificantBits());
-            output.writeLong(clientId.getLeastSignificantBits());
-            output.write(relayToken);
+            output.writeLong(id.getMostSignificantBits());
+            output.writeLong(id.getLeastSignificantBits());
+            output.write(token);
         }
         byte[] data = bytes.toByteArray();
-        udpSocket.send(new DatagramPacket(data, data.length, relayAddress));
+        socket.send(new DatagramPacket(data, data.length, relay));
     }
 
     private synchronized void sendControl(WireMessage message) throws IOException {
-        controlWriter.write(mapper.writeValueAsString(message));
-        controlWriter.newLine();
-        controlWriter.flush();
+        BufferedWriter writer = controlWriter;
+        if (writer == null) {
+            throw new IOException("Kanał sterujący nie jest połączony");
+        }
+        JsonLines.write(writer, mapper.writeValueAsString(message));
     }
 
     private String keyContext(int keyEpoch, UUID sender, UUID recipient) {
-        return "voice-key/v1/" + room + "/" + keyEpoch + "/" + sender + "/" + recipient;
+        return "voice-key/v2/" + room + "/" + keyEpoch + "/" + sender + "/" + recipient;
     }
 
     private void publishRoomState() {
-        listener.onRoomState(members.values().stream()
-                        .sorted(java.util.Comparator.comparing(MemberInfo::nickname,
-                                String.CASE_INSENSITIVE_ORDER))
-                        .toList(),
-                clientId, leaderId, epoch);
-        listener.onEncryptionChanged(groupKey != null, epoch);
+        List<MemberInfo> snapshot;
+        UUID self;
+        UUID leader;
+        int currentEpoch;
+        boolean ready;
+        synchronized (stateLock) {
+            snapshot = members.values().stream()
+                    .sorted(Comparator.comparing(MemberInfo::nickname,
+                            Comparator.nullsLast(String.CASE_INSENSITIVE_ORDER)))
+                    .toList();
+            self = clientId;
+            leader = leaderId;
+            currentEpoch = epoch;
+            ready = audioKey != null && audioKey.epoch() == currentEpoch;
+        }
+        listener.onRoomState(snapshot, self, leader, currentEpoch);
+        listener.onEncryptionChanged(ready, currentEpoch);
     }
 
     void setMuted(boolean muted) {
@@ -356,20 +588,58 @@ final class VoiceClient implements AutoCloseable {
 
     @Override
     public void close() {
+        userClosing.set(true);
+        releaseResources();
+        welcomed.countDown();
+        if (started.get()) {
+            notifyDisconnected("Rozłączono");
+        }
+    }
+
+    private void releaseResources() {
         running.set(false);
-        if (audio != null) {
-            audio.close();
+        if (!resourcesClosed.compareAndSet(false, true)) {
+            return;
         }
-        if (udpSocket != null) {
-            udpSocket.close();
+        OpusVoiceEngine engine = audio;
+        audio = null;
+        if (engine != null) {
+            engine.close();
         }
-        try {
-            if (controlSocket != null) {
-                controlSocket.close();
+        DatagramSocket socket = udpSocket;
+        udpSocket = null;
+        if (socket != null) {
+            socket.close();
+        }
+        Socket control = controlSocket;
+        controlSocket = null;
+        if (control != null) {
+            try {
+                control.close();
+            } catch (IOException ignored) {
+                // The socket may already be closed by the peer.
             }
-        } catch (IOException ignored) {
         }
-        notifyDisconnected("Rozłączono");
+    }
+
+    private static UUID parseOptionalUuid(String value, String field) {
+        return value == null ? null : parseUuid(value, field);
+    }
+
+    private static UUID parseUuid(String value, String field) {
+        try {
+            return UUID.fromString(value);
+        } catch (IllegalArgumentException exception) {
+            throw new IllegalArgumentException("Nieprawidłowy " + field, exception);
+        }
+    }
+
+    private static String messageOf(Exception exception) {
+        String message = exception.getMessage();
+        return message == null || message.isBlank()
+                ? exception.getClass().getSimpleName() : message;
+    }
+
+    private record AudioKey(int epoch, SecretKeySpec key) {
     }
 }
-

@@ -26,29 +26,36 @@ import javafx.scene.layout.VBox;
 import javafx.stage.Stage;
 import javafx.util.Duration;
 import pl.edu.voice.common.MemberInfo;
+import pl.edu.voice.common.NameRules;
 
+import java.net.ConnectException;
+import java.net.NoRouteToHostException;
+import java.net.SocketTimeoutException;
+import java.net.UnknownHostException;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.regex.Pattern;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class VoiceChatApplication extends Application {
-    private static final Pattern SAFE_NAME = Pattern.compile("[\\p{L}\\p{N}_-]{1,40}");
     private static final double SPEAKING_THRESHOLD = 0.04;
     private static final long SPEAKING_HANGOVER_NANOS = 420_000_000L;
 
     private final ObservableList<MemberInfo> participants = FXCollections.observableArrayList();
     private final Map<UUID, Long> speakingUntil = new ConcurrentHashMap<>();
+    private final AtomicLong connectionGeneration = new AtomicLong();
     private Stage stage;
     private StackPane appRoot;
-    private VoiceClient client;
+    private volatile VoiceClient client;
+    private volatile long activeGeneration;
     private ListView<MemberInfo> participantList;
     private Label connectionLabel;
     private Label encryptionLabel;
     private Label epochLabel;
     private Label roomSubtitle;
     private Label errorBanner;
+    private Label loginErrorLabel;
     private ProgressBar microphoneLevel;
     private ToggleButton muteButton;
     private ToggleButton deafenButton;
@@ -82,6 +89,7 @@ public class VoiceChatApplication extends Application {
     }
 
     private void showLogin(String error) {
+        clearRoomReferences();
         VBox hero = new VBox(18);
         hero.getStyleClass().add("login-hero");
         hero.setAlignment(Pos.CENTER_LEFT);
@@ -131,6 +139,7 @@ public class VoiceChatApplication extends Application {
         loginError.setWrapText(true);
         loginError.setVisible(error != null && !error.isBlank());
         loginError.setManaged(loginError.isVisible());
+        loginErrorLabel = loginError;
 
         Button connect = new Button("Dołącz do pokoju");
         connect.getStyleClass().add("primary-button");
@@ -164,8 +173,7 @@ public class VoiceChatApplication extends Application {
         String host = serverField.getText().trim();
         String room = roomField.getText().trim();
         String nickname = nicknameField.getText().trim();
-        if (host.isBlank() || !SAFE_NAME.matcher(room).matches()
-                || !SAFE_NAME.matcher(nickname).matches()) {
+        if (host.isBlank() || !NameRules.isValid(room) || !NameRules.isValid(nickname)) {
             showFormError(loginError,
                     "Podaj serwer oraz nazwę pokoju i nickname (1–40 liter, cyfr, _ lub -).");
             return;
@@ -197,28 +205,61 @@ public class VoiceChatApplication extends Application {
         loginError.setManaged(false);
         loginError.setVisible(false);
 
+        long generation = connectionGeneration.incrementAndGet();
+        activeGeneration = generation;
         Thread.ofVirtual().name("gui-connect").start(() -> {
             VoiceClient candidate = null;
             try {
                 candidate = new VoiceClient(host, controlPort, udpPort, room, nickname,
-                        new UiClientListener());
+                        new UiClientListener(generation));
                 client = candidate;
                 candidate.start();
-                if (candidate.isRunning()) {
-                    Platform.runLater(this::showRoom);
+                if (!candidate.isRunning() || generation != activeGeneration) {
+                    candidate.close();
+                    if (client == candidate) {
+                        client = null;
+                    }
+                    if (generation == activeGeneration) {
+                        activeGeneration = 0;
+                        String message = pendingError == null
+                                ? "Nie udało się dołączyć do pokoju." : pendingError;
+                        showLoginAfterFailure(generation, message);
+                    }
+                    return;
                 }
+                Platform.runLater(() -> {
+                    if (generation == activeGeneration) {
+                        showRoom();
+                    }
+                });
             } catch (Exception exception) {
                 if (candidate != null) {
                     candidate.close();
                 }
-                client = null;
-                String message = friendlyError(exception);
-                Platform.runLater(() -> showLogin(message));
+                if (client == candidate) {
+                    client = null;
+                }
+                if (generation == activeGeneration) {
+                    activeGeneration = 0;
+                    String message = friendlyError(exception);
+                    showLoginAfterFailure(generation, message);
+                }
             }
         });
     }
 
     private void showRoom() {
+        VoiceClient active = client;
+        if (active == null || !active.isRunning() || activeGeneration == 0) {
+            activeGeneration = 0;
+            client = null;
+            if (active != null) {
+                active.close();
+            }
+            showLogin(pendingError == null
+                    ? "Połączenie z serwerem zostało zakończone." : pendingError);
+            return;
+        }
         BorderPane layout = new BorderPane();
         layout.getStyleClass().add("room-layout");
         layout.setLeft(createSidebar());
@@ -347,7 +388,6 @@ public class VoiceChatApplication extends Application {
             boolean deafened = deafenButton.isSelected();
             deafenButton.setText(deafened ? "Włącz dźwięk" : "Wycisz dźwięk");
             if (client != null) client.setDeafened(deafened);
-            if (deafened && !muteButton.isSelected()) muteButton.fire();
         });
 
         Button disconnectButton = new Button("Rozłącz");
@@ -359,13 +399,28 @@ public class VoiceChatApplication extends Application {
     }
 
     private void disconnect() {
+        activeGeneration = 0;
         VoiceClient active = client;
         client = null;
         if (active != null) active.close();
         speakingUntil.clear();
         hadSpeakingParticipant = false;
         participants.clear();
+        pendingError = null;
         showLogin(null);
+    }
+
+    private void clearRoomReferences() {
+        participantList = null;
+        connectionLabel = null;
+        encryptionLabel = null;
+        epochLabel = null;
+        roomSubtitle = null;
+        errorBanner = null;
+        loginErrorLabel = null;
+        microphoneLevel = null;
+        muteButton = null;
+        deafenButton = null;
     }
 
     private void startSpeakingAnimation() {
@@ -396,7 +451,7 @@ public class VoiceChatApplication extends Application {
     }
 
     private void publishMemberList() {
-        if (participantList != null) {
+        if (participantList != null && roomSubtitle != null) {
             participantList.refresh();
             roomSubtitle.setText(participants.size()
                     + (participants.size() == 1 ? " uczestnik" : " uczestników"));
@@ -433,47 +488,100 @@ public class VoiceChatApplication extends Application {
     }
 
     private static String friendlyError(Exception exception) {
-        String message = exception.getMessage();
-        if (message == null || message.isBlank()) return "Nie udało się połączyć z serwerem.";
-        if (message.contains("Connection refused")) {
+        if (exception instanceof ConnectException) {
             return "Serwer nie odpowiada. Najpierw uruchom plik server JAR.";
         }
-        return message;
+        if (exception instanceof SocketTimeoutException) {
+            return "Przekroczono czas oczekiwania na serwer.";
+        }
+        if (exception instanceof UnknownHostException) {
+            return "Nie można odnaleźć serwera o podanym adresie.";
+        }
+        if (exception instanceof NoRouteToHostException) {
+            return "Brak trasy do serwera. Sprawdź sieć i zaporę.";
+        }
+        String message = exception.getMessage();
+        return message == null || message.isBlank()
+                ? "Nie udało się połączyć z serwerem." : message;
+    }
+
+    private void showLoginAfterFailure(long failedGeneration, String message) {
+        Platform.runLater(() -> {
+            // Do not overwrite a newer connection attempt started by the user.
+            if (activeGeneration == 0 && connectionGeneration.get() == failedGeneration) {
+                showLogin(message);
+            }
+        });
     }
 
     @Override
     public void stop() {
-        if (speakingAnimation != null) speakingAnimation.stop();
-        if (client != null) client.close();
+        activeGeneration = 0;
+        if (speakingAnimation != null) {
+            speakingAnimation.stop();
+        }
+        VoiceClient active = client;
+        client = null;
+        if (active != null) {
+            active.close();
+        }
     }
 
     private final class UiClientListener implements VoiceClientListener {
+        private final long generation;
+
+        private UiClientListener(long generation) {
+            this.generation = generation;
+        }
+
+        private boolean current() {
+            return generation == activeGeneration;
+        }
+
         @Override
         public void onStatus(String status) {
+            if (!current()) {
+                return;
+            }
             latestStatus = status;
             Platform.runLater(() -> {
-                if (connectionLabel != null) connectionLabel.setText(status);
+                if (current() && connectionLabel != null) {
+                    connectionLabel.setText(status);
+                }
             });
         }
 
         @Override
         public void onRoomState(List<MemberInfo> newMembers, UUID newSelfId,
                                 UUID newLeaderId, int epoch) {
+            if (!current()) {
+                return;
+            }
             selfId = newSelfId;
             leaderId = newLeaderId;
             currentEpoch = epoch;
             Platform.runLater(() -> {
+                if (!current()) {
+                    return;
+                }
                 participants.setAll(newMembers);
-                if (epochLabel != null) epochLabel.setText("Epoka " + epoch);
+                if (epochLabel != null) {
+                    epochLabel.setText("Epoka " + epoch);
+                }
                 publishMemberList();
             });
         }
 
         @Override
         public void onEncryptionChanged(boolean ready, int epoch) {
+            if (!current()) {
+                return;
+            }
             encryptionReady = ready;
             Platform.runLater(() -> {
-                if (encryptionLabel == null) return;
+                if (!current() || encryptionLabel == null) {
+                    return;
+                }
                 encryptionLabel.setText(ready ? "E2EE aktywne" : "Uzgadnianie klucza…");
                 encryptionLabel.getStyleClass().removeAll(
                         "encryption-ready", "encryption-waiting");
@@ -484,39 +592,60 @@ public class VoiceChatApplication extends Application {
 
         @Override
         public void onLocalAudioLevel(double level) {
+            if (!current()) {
+                return;
+            }
             registerAudioLevel(selfId, level);
             Platform.runLater(() -> {
-                if (microphoneLevel != null) microphoneLevel.setProgress(level);
+                if (current() && microphoneLevel != null) {
+                    microphoneLevel.setProgress(level);
+                }
             });
         }
 
         @Override
         public void onParticipantAudioLevel(UUID participantId, double level) {
-            registerAudioLevel(participantId, level);
+            if (current()) {
+                registerAudioLevel(participantId, level);
+            }
         }
 
         @Override
         public void onError(String message) {
+            if (!current()) {
+                return;
+            }
             pendingError = message;
             Platform.runLater(() -> {
+                if (!current()) {
+                    return;
+                }
                 if (errorBanner != null) {
                     errorBanner.setText(message);
                     errorBanner.setManaged(true);
                     errorBanner.setVisible(true);
+                } else if (loginErrorLabel != null) {
+                    showFormError(loginErrorLabel, message);
                 }
             });
         }
 
         @Override
         public void onDisconnected(String reason) {
+            if (!current()) {
+                return;
+            }
             Platform.runLater(() -> {
-                if (connectionLabel != null) {
-                    connectionLabel.setText(reason);
-                    connectionLabel.getStyleClass().remove("connected-label");
-                    connectionLabel.getStyleClass().add("disconnected-label");
+                if (!current()) {
+                    return;
                 }
-                if (muteButton != null) muteButton.setDisable(true);
-                if (deafenButton != null) deafenButton.setDisable(true);
+                activeGeneration = 0;
+                client = null;
+                speakingUntil.clear();
+                hadSpeakingParticipant = false;
+                participants.clear();
+                pendingError = reason;
+                showLogin(reason);
             });
         }
     }
