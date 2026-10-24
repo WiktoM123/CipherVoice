@@ -50,6 +50,15 @@ class UdpRelayServerTest {
                 }
 
                 byte[] audio = audioPacket(alice, change.epoch());
+                byte[] wrongLength = audio.clone();
+                ByteBuffer.wrap(wrongLength).putShort(Protocol.AUDIO_HEADER_BYTES - Short.BYTES,
+                        (short) (Protocol.GCM_TAG_BYTES + 1));
+                aliceSocket.send(new DatagramPacket(wrongLength, wrongLength.length,
+                        new InetSocketAddress("127.0.0.1", udpPort)));
+                byte[] oldVersion = audio.clone();
+                oldVersion[Integer.BYTES] = 2;
+                aliceSocket.send(new DatagramPacket(oldVersion, oldVersion.length,
+                        new InetSocketAddress("127.0.0.1", udpPort)));
                 aliceSocket.send(new DatagramPacket(audio, audio.length,
                         new InetSocketAddress("127.0.0.1", udpPort)));
 
@@ -87,6 +96,7 @@ class UdpRelayServerTest {
                 .putInt(epoch)
                 .putInt(sender.senderTag)
                 .putLong(1)
+                .put(new byte[]{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11})
                 .putShort((short) Protocol.GCM_TAG_BYTES)
                 .put(new byte[Protocol.GCM_TAG_BYTES]);
         return packet.array();

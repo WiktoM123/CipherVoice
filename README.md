@@ -160,8 +160,9 @@ Serwer nie wykonuje kroku odszyfrowania ani dekodowania Opus.
 
 Nagłówek jest uwierzytelniany przez AES-GCM jako AAD. Nie jest tajny, ale jego
 podmiana — w tym zmiana długości szyfrogramu — powoduje odrzucenie pakietu.
-Bieżąca wersja protokołu to `2`. Wersja 2 nie jest kompatybilna z poprzednią
-wersją protokołu — klienta i serwer należy wdrożyć razem.
+Bieżąca wersja protokołu to `3`. Wersja 3 dodaje osobne pole losowego nonce
+i nie jest kompatybilna z wersjami 1 i 2 — klienta i serwer należy przebudować
+i wdrożyć razem. Kontekst kopert klucza również używa wersji 3.
 
 | Pole | Rozmiar | Znaczenie |
 |---|---:|---|
@@ -169,15 +170,31 @@ wersją protokołu — klienta i serwer należy wdrożyć razem.
 | `version` | 1 B | wersja protokołu |
 | `senderId` | 16 B | UUID nadawcy |
 | `epoch` | 4 B | aktualna epoka klucza |
-| `senderTag` | 4 B | unikalna część nonce nadawcy |
+| `senderTag` | 4 B | identyfikator nadawcy sprawdzany przez relay i odbiorcę |
 | `sequence` | 8 B | rosnący numer pakietu |
+| `nonce` | 12 B | losowy IV AES-GCM generowany osobno dla każdego szyfrowania |
 | `ciphertextLength` | 2 B | długość szyfrogramu |
 | `ciphertext` | zmienny | Opus zaszyfrowany wraz z tagiem GCM |
 
-Nonce AES-GCM ma 12 bajtów i składa się z `senderTag` (4 B) oraz `sequence`
-(8 B). Każdy nadawca ma własny `senderTag`, a licznik `sequence` jest monotoniczny
-przez cały czas życia sesji i **nie jest zerowany przy zmianie epoki**. Dzięki
-temu ten sam nonce nigdy nie zostaje użyty z dwoma różnymi kluczami AES-GCM.
+Nonce AES-GCM ma dokładnie 12 bajtów. Dla każdego szyfrowania klient wypełnia
+nową tablicę przez `SecureRandom.nextBytes`, czyli CSPRNG platformy Java.
+Żaden bajt nonce nie pochodzi z `senderTag`, numeru sekwencji ani epoki.
+Odbiorca odczytuje nonce z pakietu i używa go jako IV przy odszyfrowywaniu.
+Cały 51-bajtowy nagłówek, łącznie z nonce, jest objęty AAD; modyfikacja nonce
+powoduje odrzucenie pakietu przez weryfikację GCM. Nonce nie musi być tajny.
+
+Licznik `sequence` nadal służy ochronie przed replay. Jest monotoniczny przez
+całą sesję i **nie jest zerowany przy zmianie epoki**, ale nie tworzy już nonce.
+Losowanie 96 bitów daje bardzo małe, lecz niezerowe prawdopodobieństwo kolizji.
+Zgodnie z [NIST SP 800-38D, sekcja 8.3](https://nvlpubs.nist.gov/nistpubs/Legacy/SP/nistspecialpublication800-38d.pdf)
+liczba szyfrowań z losowym nonce jest ograniczona do `2^32` na klucz,
+łącznie dla wszystkich nadawców. Klient otrzymuje lokalny budżet
+`floor(2^32 / liczba_uczestników_epoki)`; liczy także pakiety, których wysłanie
+się nie udało. Powtórzona koperta tego samego klucza nie zeruje budżetu.
+Po wyczerpaniu budżetu klient zatrzymuje wysyłanie i zgłasza konieczność
+ponownego dołączenia do pokoju, aby wymusić nowy klucz. Nowa epoka z nowym
+kluczem otrzymuje nowy budżet. Limit zakłada zgodny skład pokoju i klientów
+przestrzegających protokołu; nie zastępuje uwierzytelnienia uczestników.
 
 ## Komunikaty kanału sterującego
 
@@ -303,14 +320,14 @@ Uruchomienie testów bez pakowania:
 
 ### Testy automatyczne
 
-Projekt zawiera 28 testów:
+Projekt zawiera 34 testy:
 
 | Moduł | Zakres |
 |---|---|
 | `common` | walidacja nazw, limit linii JSON, kodowanie kluczy X25519 |
-| `client` | HKDF, koperty klucza, nonce, uwierzytelnianie nagłówka i odrzucanie błędnych pakietów |
+| `client` | HKDF, koperty klucza, losowe 12-bajtowe nonce, niezależne odszyfrowanie GCM, uwierzytelnianie nagłówka i odrzucanie błędnych pakietów |
 | `server` | pokoje, lider, epoki, uprawnienia do dystrybucji klucza, przekaźnik UDP |
-| `server` (integracja) | prawdziwy serwer TCP/UDP i klienci z wyłączonym audio: wspólny klucz epoki, rotacja po dołączeniu/opuszczeniu oraz równoczesne dołączanie pięciu osób |
+| `server` (integracja) | prawdziwy serwer TCP/UDP i klienci z wyłączonym audio: wspólny klucz epoki, rotacja po dołączeniu/opuszczeniu, równoczesne dołączanie pięciu osób, przesyłanie zaszyfrowanych pakietów, odrzucanie zmienionego nonce oraz limit użycia klucza |
 
 Test integracyjny nie otwiera mikrofonu ani głośników. Odsłuch na żywo wymaga
 fizycznych urządzeń audio i nie jest częścią testów automatycznych.

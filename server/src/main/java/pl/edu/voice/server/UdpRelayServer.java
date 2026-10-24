@@ -106,6 +106,12 @@ public class UdpRelayServer {
         UUID id = new UUID(input.getLong(), input.getLong());
         int epoch = input.getInt();
         int senderTag = input.getInt();
+        input.getLong(); // sequence is checked by recipients
+        input.position(input.position() + Protocol.GCM_NONCE_BYTES);
+        int ciphertextLength = Short.toUnsignedInt(input.getShort());
+        if (ciphertextLength < Protocol.GCM_TAG_BYTES || ciphertextLength != input.remaining()) {
+            return;
+        }
         ClientSession sender = rooms.find(id);
         InetSocketAddress source = new InetSocketAddress(
                 incoming.getAddress(), incoming.getPort());

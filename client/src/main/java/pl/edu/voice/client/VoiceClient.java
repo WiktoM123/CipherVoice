@@ -22,6 +22,7 @@ import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
 import java.security.KeyPair;
+import java.security.MessageDigest;
 import java.security.PublicKey;
 import java.util.ArrayList;
 import java.util.Base64;
@@ -295,7 +296,7 @@ final class VoiceClient implements AutoCloseable {
                 return; // duplicate REKEY_REQUEST for an epoch that already has a key
             }
             newKey = CryptoSupport.newGroupKey();
-            audioKey = new AudioKey(requestedEpoch, newKey);
+            audioKey = new AudioKey(requestedEpoch, newKey, members.size());
             roster = Map.copyOf(members);
         }
 
@@ -376,7 +377,16 @@ final class VoiceClient implements AutoCloseable {
                 failure = messageOf(exception);
             }
             if (acceptedKey != null) {
-                audioKey = new AudioKey(acceptedEpoch, acceptedKey);
+                AudioKey current = audioKey;
+                if (current != null && current.epoch() == acceptedEpoch) {
+                    // Replayed envelopes must not reset the per-key encryption budget.
+                    if (!MessageDigest.isEqual(current.key().getEncoded(), acceptedKey.getEncoded())) {
+                        failure = "Sprzeczne klucze grupowe dla tej samej epoki";
+                        acceptedKey = null;
+                    }
+                } else {
+                    audioKey = new AudioKey(acceptedEpoch, acceptedKey, members.size());
+                }
             }
         }
         if (failure != null) {
@@ -451,6 +461,14 @@ final class VoiceClient implements AutoCloseable {
             UUID sender = clientId;
             if (!running.get() || currentKey == null || socket == null
                     || sender == null || relayAddress == null || opus == null) {
+                return;
+            }
+            long invocation = currentKey.claimEncryption();
+            if (invocation >= currentKey.packetLimit()) {
+                if (invocation == currentKey.packetLimit()) {
+                    listener.onError("Osiągnięto limit użycia klucza AES-GCM. "
+                            + "Dołącz ponownie do pokoju, aby zmienić klucz.");
+                }
                 return;
             }
             long packetSequence = sequence.getAndIncrement();
@@ -539,7 +557,8 @@ final class VoiceClient implements AutoCloseable {
     }
 
     private String keyContext(int keyEpoch, UUID sender, UUID recipient) {
-        return "voice-key/v2/" + room + "/" + keyEpoch + "/" + sender + "/" + recipient;
+        return "voice-key/v" + Protocol.VERSION + "/" + room + "/" + keyEpoch
+                + "/" + sender + "/" + recipient;
     }
 
     private void publishRoomState() {
@@ -640,6 +659,17 @@ final class VoiceClient implements AutoCloseable {
                 ? exception.getClass().getSimpleName() : message;
     }
 
-    private record AudioKey(int epoch, SecretKeySpec key) {
+    private record AudioKey(int epoch, SecretKeySpec key, long packetLimit,
+                            AtomicLong encryptedPackets) {
+        AudioKey(int epoch, SecretKeySpec key, int participants) {
+            this(epoch, key, Protocol.MAX_RANDOM_NONCE_ENCRYPTIONS_PER_KEY
+                    / Math.max(1, participants), new AtomicLong());
+        }
+
+        long claimEncryption() {
+            // Reserve before encrypting, even if encryption or UDP sending fails.
+            // Saturate so repeated calls after exhaustion cannot wrap the counter.
+            return encryptedPackets.getAndUpdate(count -> Math.min(count + 1, packetLimit + 1));
+        }
     }
 }

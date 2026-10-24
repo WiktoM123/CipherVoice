@@ -4,10 +4,15 @@ import org.junit.jupiter.api.Test;
 import pl.edu.voice.common.Protocol;
 
 import javax.crypto.AEADBadTagException;
+import javax.crypto.Cipher;
+import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 import java.security.GeneralSecurityException;
 import java.security.KeyPair;
 import java.util.HexFormat;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -16,7 +21,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class CryptoSupportTest {
-    private static final String CONTEXT = "voice-key/v2/test/1/leader/member";
+    private static final String CONTEXT = "voice-key/v" + Protocol.VERSION + "/test/1/leader/member";
 
     @Test
     void leaderCanWrapGroupKeyForAnotherMember() throws Exception {
@@ -41,7 +46,7 @@ class CryptoSupportTest {
 
         assertThrows(AEADBadTagException.class, () -> CryptoSupport.unwrapGroupKey(
                 wrapped, member.getPrivate(), leader.getPublic(),
-                "voice-key/v2/test/2/leader/member"));
+                "voice-key/v" + Protocol.VERSION + "/test/2/leader/member"));
     }
 
     @Test
@@ -133,7 +138,7 @@ class CryptoSupportTest {
         SecretKeySpec key = CryptoSupport.newGroupKey();
         byte[] packet = AudioPacketCodec.encrypt(UUID.randomUUID(), 7, 1234, 10,
                 new byte[]{1, 2, 3, 4}, key);
-        packet[38] ^= 1; // low byte of ciphertextLength
+        packet[Protocol.AUDIO_HEADER_BYTES - 1] ^= 1; // low byte of ciphertextLength
 
         assertThrows(IllegalArgumentException.class,
                 () -> AudioPacketCodec.decrypt(packet, key));
@@ -162,15 +167,75 @@ class CryptoSupportTest {
     }
 
     @Test
-    void sequenceAndTagProduceDistinctPackets() throws Exception {
+    void identicalSenderSequenceAndPlaintextUseFreshRandomNonces() throws Exception {
         SecretKeySpec key = CryptoSupport.newGroupKey();
         UUID sender = UUID.randomUUID();
-        byte[] first = AudioPacketCodec.encrypt(sender, 1, 100, 0, new byte[]{1}, key);
-        byte[] second = AudioPacketCodec.encrypt(sender, 1, 100, 1, new byte[]{1}, key);
-        byte[] otherSender = AudioPacketCodec.encrypt(sender, 1, 101, 0, new byte[]{1}, key);
+        Set<String> nonces = new HashSet<>();
+        for (int i = 0; i < 32; i++) {
+            byte[] packet = AudioPacketCodec.encrypt(sender, 1, 100, 0, new byte[]{1}, key);
+            byte[] nonce = packetNonce(packet);
+            assertEquals(12, nonce.length);
+            assertTrue(nonces.add(HexFormat.of().formatHex(nonce)), "Nonce was reused");
+            assertArrayEquals(new byte[]{1}, AudioPacketCodec.decrypt(packet, key).opus());
+        }
+    }
 
-        assertTrue(!java.util.Arrays.equals(first, second));
-        assertTrue(!java.util.Arrays.equals(first, otherSender));
+    @Test
+    void serializedNonceIsTheActualGcmIv() throws Exception {
+        SecretKeySpec key = CryptoSupport.newGroupKey();
+        byte[] opus = {9, 8, 7, 6};
+        byte[] packet = AudioPacketCodec.encrypt(UUID.randomUUID(), 1, 100, 0, opus, key);
+        assertEquals(51, Protocol.AUDIO_HEADER_BYTES);
+        assertEquals(Protocol.AUDIO_HEADER_BYTES + opus.length + Protocol.GCM_TAG_BYTES,
+                packet.length);
+        Cipher independentDecoder = Cipher.getInstance("AES/GCM/NoPadding");
+        independentDecoder.init(Cipher.DECRYPT_MODE, key,
+                new GCMParameterSpec(Protocol.GCM_TAG_BITS, packetNonce(packet)));
+        independentDecoder.updateAAD(packet, 0, Protocol.AUDIO_HEADER_BYTES);
+        assertArrayEquals(opus, independentDecoder.doFinal(Arrays.copyOfRange(
+                packet, Protocol.AUDIO_HEADER_BYTES, packet.length)));
+    }
+
+    @Test
+    void everyNonceByteIsAuthenticated() throws Exception {
+        SecretKeySpec key = CryptoSupport.newGroupKey();
+        byte[] packet = AudioPacketCodec.encrypt(UUID.randomUUID(), 1, 100, 0,
+                new byte[]{1, 2}, key);
+        int nonceOffset = Protocol.AUDIO_HEADER_BYTES - Short.BYTES - Protocol.GCM_NONCE_BYTES;
+        for (int i = 0; i < Protocol.GCM_NONCE_BYTES; i++) {
+            byte[] changed = packet.clone();
+            changed[nonceOffset + i] ^= 1;
+            assertThrows(AEADBadTagException.class, () -> AudioPacketCodec.decrypt(changed, key));
+        }
+        assertThrows(IllegalArgumentException.class, () -> AudioPacketCodec.decrypt(
+                Arrays.copyOf(packet, nonceOffset + Protocol.GCM_NONCE_BYTES - 1), key));
+    }
+
+    @Test
+    void oldProtocolVersionIsRejected() throws Exception {
+        SecretKeySpec key = CryptoSupport.newGroupKey();
+        byte[] packet = AudioPacketCodec.encrypt(UUID.randomUUID(), 1, 100, 0, new byte[]{1}, key);
+        packet[Integer.BYTES] = 2;
+        assertThrows(IllegalArgumentException.class, () -> AudioPacketCodec.decrypt(packet, key));
+        assertEquals(-1, AudioPacketCodec.peekEpoch(packet));
+    }
+
+    @Test
+    void packetSizeLimitIncludesTheRandomNonce() throws Exception {
+        SecretKeySpec key = CryptoSupport.newGroupKey();
+        int maxOpusBytes = Protocol.MAX_DATAGRAM_BYTES - Protocol.AUDIO_HEADER_BYTES
+                - Protocol.GCM_TAG_BYTES;
+        byte[] opus = new byte[maxOpusBytes];
+        byte[] packet = AudioPacketCodec.encrypt(UUID.randomUUID(), 1, 100, 0, opus, key);
+        assertEquals(Protocol.MAX_DATAGRAM_BYTES, packet.length);
+        assertArrayEquals(opus, AudioPacketCodec.decrypt(packet, key).opus());
+        assertThrows(IllegalArgumentException.class, () -> AudioPacketCodec.encrypt(
+                UUID.randomUUID(), 1, 100, 1, new byte[maxOpusBytes + 1], key));
+    }
+
+    private static byte[] packetNonce(byte[] packet) {
+        int nonceOffset = Protocol.AUDIO_HEADER_BYTES - Short.BYTES - Protocol.GCM_NONCE_BYTES;
+        return Arrays.copyOfRange(packet, nonceOffset, nonceOffset + Protocol.GCM_NONCE_BYTES);
     }
 
     private static byte[] fill(int length, byte value) {

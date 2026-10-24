@@ -7,6 +7,7 @@ import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 import java.nio.ByteBuffer;
 import java.security.GeneralSecurityException;
+import java.security.SecureRandom;
 import java.util.UUID;
 
 /**
@@ -14,21 +15,21 @@ import java.util.UUID;
  *
  * <pre>
  * magic(4) | version(1) | senderId(16) | epoch(4) | senderTag(4) |
- * sequence(8) | ciphertextLength(2) | ciphertext + GCM tag
+ * sequence(8) | randomNonce(12) | ciphertextLength(2) | ciphertext + GCM tag
  * </pre>
  *
- * The whole header including the length field is authenticated as AAD, so no
+ * Each encryption draws a fresh 96-bit nonce from SecureRandom, independently
+ * of senderTag and sequence. The whole header including the nonce and length
+ * field is authenticated as AAD, so no
  * part of the packet can be altered without the GCM check failing.
  */
 final class AudioPacketCodec {
+    private static final SecureRandom RANDOM = new SecureRandom();
     private static final int MAGIC_OFFSET = 0;
     private static final int VERSION_OFFSET = Integer.BYTES;
     private static final int SENDER_ID_OFFSET = VERSION_OFFSET + Byte.BYTES;
     private static final int EPOCH_OFFSET = SENDER_ID_OFFSET + 2 * Long.BYTES;
-    private static final int SENDER_TAG_OFFSET = EPOCH_OFFSET + Integer.BYTES;
-    private static final int SEQUENCE_OFFSET = SENDER_TAG_OFFSET + Integer.BYTES;
-    private static final int LENGTH_OFFSET = SEQUENCE_OFFSET + Long.BYTES;
-    private static final int HEADER_BYTES = LENGTH_OFFSET + Short.BYTES;
+    private static final int HEADER_BYTES = Protocol.AUDIO_HEADER_BYTES;
 
     private AudioPacketCodec() {
     }
@@ -44,12 +45,14 @@ final class AudioPacketCodec {
             throw new IllegalArgumentException("Pakiet audio jest zbyt duży");
         }
 
+        byte[] nonce = new byte[Protocol.GCM_NONCE_BYTES];
+        RANDOM.nextBytes(nonce);
         ByteBuffer packet = ByteBuffer.allocate(packetLength);
-        putHeader(packet, senderId, epoch, senderTag, sequence, ciphertextLength);
+        putHeader(packet, senderId, epoch, senderTag, sequence, nonce, ciphertextLength);
 
         Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
         cipher.init(Cipher.ENCRYPT_MODE, key,
-                new GCMParameterSpec(Protocol.GCM_TAG_BITS, nonce(senderTag, sequence)));
+                new GCMParameterSpec(Protocol.GCM_TAG_BITS, nonce));
         cipher.updateAAD(packet.array(), 0, HEADER_BYTES);
         byte[] encrypted = cipher.doFinal(opus);
         packet.put(encrypted);
@@ -73,6 +76,8 @@ final class AudioPacketCodec {
         int epoch = buffer.getInt();
         int senderTag = buffer.getInt();
         long sequence = buffer.getLong();
+        byte[] nonce = new byte[Protocol.GCM_NONCE_BYTES];
+        buffer.get(nonce);
         int length = Short.toUnsignedInt(buffer.getShort());
         if (length < Protocol.GCM_TAG_BYTES || length != buffer.remaining()) {
             throw new IllegalArgumentException("Nieprawidłowa długość pakietu audio");
@@ -82,7 +87,7 @@ final class AudioPacketCodec {
 
         Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
         cipher.init(Cipher.DECRYPT_MODE, key,
-                new GCMParameterSpec(Protocol.GCM_TAG_BITS, nonce(senderTag, sequence)));
+                new GCMParameterSpec(Protocol.GCM_TAG_BITS, nonce));
         cipher.updateAAD(datagram, 0, HEADER_BYTES);
         byte[] opus = cipher.doFinal(ciphertext);
         return new DecodedPacket(senderId, epoch, senderTag, sequence, opus);
@@ -106,7 +111,7 @@ final class AudioPacketCodec {
     }
 
     private static void putHeader(ByteBuffer packet, UUID senderId, int epoch, int senderTag,
-                                  long sequence, int ciphertextLength) {
+                                  long sequence, byte[] nonce, int ciphertextLength) {
         packet.putInt(Protocol.AUDIO_MAGIC)
                 .put(Protocol.VERSION)
                 .putLong(senderId.getMostSignificantBits())
@@ -114,14 +119,8 @@ final class AudioPacketCodec {
                 .putInt(epoch)
                 .putInt(senderTag)
                 .putLong(sequence)
+                .put(nonce)
                 .putShort((short) ciphertextLength);
-    }
-
-    private static byte[] nonce(int senderTag, long sequence) {
-        return ByteBuffer.allocate(Protocol.GCM_NONCE_BYTES)
-                .putInt(senderTag)
-                .putLong(sequence)
-                .array();
     }
 
     record DecodedPacket(UUID senderId, int epoch, int senderTag, long sequence, byte[] opus) {
