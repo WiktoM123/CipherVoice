@@ -1,8 +1,7 @@
 # CipherVoice
 
 Desktopowy komunikator głosowy do rozmów grupowych z szyfrowaniem end-to-end
-(E2EE). Projekt powstaje jako praca inżynierska i przypomina uproszczony
-TeamSpeak: użytkownik podaje nickname i nazwę pokoju, bez zakładania konta.
+(E2EE)
 
 Serwer pośredniczy w zestawieniu pokoju i przekazuje pakiety audio, ale nie
 otrzymuje grupowego klucza AES ani dźwięku w postaci jawnej.
