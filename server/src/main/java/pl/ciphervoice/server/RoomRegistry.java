@@ -2,6 +2,7 @@ package pl.ciphervoice.server;
 
 import org.springframework.stereotype.Component;
 import pl.ciphervoice.common.MemberInfo;
+import pl.ciphervoice.common.NameRules;
 
 import javax.crypto.KeyAgreement;
 import java.security.GeneralSecurityException;
@@ -21,18 +22,15 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.regex.Pattern;
 
 @Component
 public class RoomRegistry {
-    private static final Pattern SAFE_NAME = Pattern.compile("[\\p{L}\\p{N}_-]{1,40}");
-
     private final Map<String, Room> rooms = new LinkedHashMap<>();
     private final Map<UUID, ClientSession> clients = new LinkedHashMap<>();
 
     Change join(ClientSession session, String roomName, String nickname, String publicKey) {
-        validateName("Nazwa pokoju", roomName);
-        validateName("Nickname", nickname);
+        NameRules.requireValid("Nazwa pokoju", roomName);
+        NameRules.requireValid("Nickname", nickname);
         validatePublicKey(publicKey);
 
         synchronized (this) {
@@ -122,12 +120,6 @@ public class RoomRegistry {
         Publication publication = new Publication(room.lastPublication);
         room.lastPublication = publication.finished;
         return new Change(room.name, room.epoch, room.leaderId(), members, recipients, publication);
-    }
-
-    private static void validateName(String label, String value) {
-        if (value == null || !SAFE_NAME.matcher(value).matches()) {
-            throw new IllegalArgumentException(label + " może mieć 1–40 liter, cyfr, _ lub -");
-        }
     }
 
     private static void validatePublicKey(String encoded) {

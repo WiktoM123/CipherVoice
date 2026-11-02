@@ -1,8 +1,7 @@
 # CipherVoice
 
 Desktopowy komunikator głosowy do rozmów grupowych z szyfrowaniem end-to-end
-(E2EE). Projekt powstaje jako praca inżynierska i przypomina uproszczony
-TeamSpeak: użytkownik podaje nickname i nazwę pokoju, bez zakładania konta.
+(E2EE).
 
 Serwer pośredniczy w zestawieniu pokoju i przekazuje pakiety audio, ale nie
 otrzymuje grupowego klucza AES ani dźwięku w postaci jawnej.
@@ -19,10 +18,14 @@ otrzymuje grupowego klucza AES ani dźwięku w postaci jawnej.
 - uzgadnianie kluczy przy użyciu X25519 i HKDF-SHA-256;
 - automatyczna zmiana klucza po dołączeniu lub opuszczeniu pokoju;
 - ochrona przed ponownym odtworzeniem starego pakietu;
-- wyciszanie mikrofonu i głośników;
+- niezależne wyciszanie mikrofonu i odsłuchu;
+- wybór mikrofonu i głośników oraz test urządzeń w ustawieniach audio;
+- miksowanie jednoczesnych strumieni wielu mówców;
+- krótkie, ograniczone kolejki audio chroniące przed narastaniem opóźnienia;
 - wskaźnik osoby mówiącej: podświetlenie, napis i animowane kropki;
+- automatyczny powrót do ekranu logowania po utracie połączenia;
 - endpoint HTTP pokazujący stan serwera;
-- testy kryptografii.
+- testy jednostkowe i integracyjne całego protokołu.
 
 ## Technologie
 
@@ -153,16 +156,27 @@ przed użyciem koperty w innym pokoju, innej epoce lub dla innej osoby.
 6. Klient wysyła datagram UDP do serwera.
 7. Serwer sprawdza identyfikator, `senderTag`, adres UDP i epokę.
 8. Serwer przesyła ten sam zaszyfrowany datagram pozostałym osobom w pokoju.
-9. Odbiorca sprawdza epokę i numer sekwencyjny, odszyfrowuje AES-GCM, dekoduje
-   Opus i odtwarza PCM w głośnikach.
-10. Poziom odszyfrowanego PCM steruje wskaźnikiem aktywnego mówcy w GUI.
+9. Odbiorca sprawdza epokę i numer sekwencyjny, odszyfrowuje AES-GCM i dekoduje
+   Opus.
+10. Odszyfrowana ramka PCM trafia do krótkiej kolejki danego mówcy (maksymalnie
+    trzy ramki). Przy przepełnieniu najstarsza ramka jest odrzucana, więc
+    opóźnienie nie rośnie w nieskończoność.
+11. Wątek odtwarzania co 20 ms pobiera po jednej ramce od każdego aktywnego
+    mówcy, miksuje je z nasyceniem do zakresu 16 bitów i zapisuje do głośników.
+12. Poziom odszyfrowanego PCM steruje wskaźnikiem aktywnego mówcy w GUI.
+
+Wyciszenie mikrofonu zatrzymuje tylko wysyłanie nowych ramek. Wyciszenie
+dźwięku wychodzącego czyści kolejki odtwarzania i nie zmienia stanu mikrofonu.
 
 Serwer nie wykonuje kroku odszyfrowania ani dekodowania Opus.
 
 ## Format pakietu audio UDP
 
 Nagłówek jest uwierzytelniany przez AES-GCM jako AAD. Nie jest tajny, ale jego
-podmiana powoduje odrzucenie pakietu.
+podmiana — w tym zmiana długości szyfrogramu — powoduje odrzucenie pakietu.
+Bieżąca wersja protokołu to `3`. Wersja 3 dodaje osobne pole losowego nonce
+i nie jest kompatybilna z wersjami 1 i 2 — klienta i serwer należy przebudować
+i wdrożyć razem. Kontekst kopert klucza również używa wersji 3.
 
 | Pole | Rozmiar | Znaczenie |
 |---|---:|---|
@@ -170,14 +184,32 @@ podmiana powoduje odrzucenie pakietu.
 | `version` | 1 B | wersja protokołu |
 | `senderId` | 16 B | UUID nadawcy |
 | `epoch` | 4 B | aktualna epoka klucza |
-| `senderTag` | 4 B | unikalna część nonce nadawcy |
+| `senderTag` | 4 B | identyfikator nadawcy sprawdzany przez relay i odbiorcę |
 | `sequence` | 8 B | rosnący numer pakietu |
+| `nonce` | 12 B | losowy IV AES-GCM generowany osobno dla każdego szyfrowania |
 | `ciphertextLength` | 2 B | długość szyfrogramu |
 | `ciphertext` | zmienny | Opus zaszyfrowany wraz z tagiem GCM |
 
-Nonce AES-GCM ma 12 bajtów i składa się z `senderTag` (4 B) oraz `sequence`
-(8 B). Każdy nadawca ma własny `senderTag`, a licznik jest zerowany przy zmianie
-epoki, kiedy używany jest już nowy klucz.
+Nonce AES-GCM ma dokładnie 12 bajtów. Dla każdego szyfrowania klient wypełnia
+nową tablicę przez `SecureRandom.nextBytes`, czyli CSPRNG platformy Java.
+Żaden bajt nonce nie pochodzi z `senderTag`, numeru sekwencji ani epoki.
+Odbiorca odczytuje nonce z pakietu i używa go jako IV przy odszyfrowywaniu.
+Cały 51-bajtowy nagłówek, łącznie z nonce, jest objęty AAD; modyfikacja nonce
+powoduje odrzucenie pakietu przez weryfikację GCM. Nonce nie musi być tajny.
+
+Licznik `sequence` nadal służy ochronie przed replay. Rośnie w obrębie epoki
+i należy do jej kontekstu kryptograficznego. Nowa epoka ma osobny licznik
+oraz stan odbioru. Licznik nie tworzy już nonce.
+Losowanie 96 bitów daje bardzo małe, lecz niezerowe prawdopodobieństwo kolizji.
+Zgodnie z [NIST SP 800-38D, sekcja 8.3](https://nvlpubs.nist.gov/nistpubs/Legacy/SP/nistspecialpublication800-38d.pdf)
+liczba szyfrowań z losowym nonce jest ograniczona do `2^32` na klucz,
+łącznie dla wszystkich nadawców. Klient otrzymuje lokalny budżet
+`floor(2^32 / liczba_uczestników_epoki)`; liczy także pakiety, których wysłanie
+się nie udało. Powtórzona koperta tego samego klucza nie zeruje budżetu.
+Po wyczerpaniu budżetu klient zatrzymuje wysyłanie i zgłasza konieczność
+ponownego dołączenia do pokoju, aby wymusić nowy klucz. Nowa epoka z nowym
+kluczem otrzymuje nowy budżet. Limit zakłada zgodny skład pokoju i klientów
+przestrzegających protokołu; nie zastępuje uwierzytelnienia uczestników.
 
 ## Komunikaty kanału sterującego
 
@@ -202,6 +234,12 @@ Każdy komunikat TCP jest jedną linią JSON.
 | `MessageType.java` | lista typów komunikatów TCP |
 | `WireMessage.java` | obiekt wiadomości JSON przesyłanej przez TCP |
 | `MemberInfo.java` | publiczne dane uczestnika: ID, nickname, klucz publiczny i tag |
+| `JsonLines.java` | odczyt i zapis ograniczonych linii JSON |
+| `NameRules.java` | wspólne reguły nazw pokojów i uczestników |
+| `PublicKeys.java` | kodowanie i odczyt publicznych kluczy X25519 |
+| `JsonLines.java` | bezpieczny odczyt i zapis linii JSON z limitem rozmiaru |
+| `NameRules.java` | wspólna walidacja nazwy pokoju i nickname |
+| `PublicKeys.java` | kodowanie i walidacja kluczy publicznych X25519 |
 
 ### Moduł `server`
 
@@ -229,8 +267,9 @@ Każdy komunikat TCP jest jedną linią JSON.
 | `OpusVoiceEngine.java` | mikrofon, głośniki, kodowanie i dekodowanie Opus, pomiar głośności |
 | `CryptoSupport.java` | X25519, HKDF-SHA-256, AES-GCM i generowanie kluczy |
 | `EpochCryptoContext.java` | klucz danej epoki, niezależny licznik pakietów i ochrona przed powtórzeniami |
+| `WindowsThemeSupport.java` | ciemny pasek tytułu okna w Windows przez JNA |
 | `AudioPacketCodec.java` | budowanie, szyfrowanie, odczyt i odszyfrowanie datagramów |
-| `CryptoSupportTest.java` | test kopert klucza oraz wykrywania modyfikacji szyfrogramu |
+| `CryptoSupportTest.java` | testy X25519, HKDF, kopert klucza, AES-GCM i formatu pakietu |
 
 Najczęstsze miejsca zmian:
 
@@ -313,6 +352,19 @@ Pełne sprawdzenie i utworzenie paczek od zera:
 ```powershell
 .\mvnw.cmd clean verify
 ```
+### Testy automatyczne
+
+Projekt zawiera 66 testów jednostkowych i integracyjnych:
+
+| Moduł | Zakres |
+|---|---|
+| `common` | walidacja nazw, limit linii JSON, kodowanie kluczy X25519 |
+| `client` | HKDF, koperty klucza, losowe 12-bajtowe nonce, niezależne odszyfrowanie GCM, uwierzytelnianie nagłówka i odrzucanie błędnych pakietów |
+| `server` | pokoje, lider, epoki, uprawnienia do dystrybucji klucza, przekaźnik UDP |
+| `server` (integracja) | prawdziwy serwer TCP/UDP i klienci z wyłączonym audio: wspólny klucz epoki, rotacja po dołączeniu/opuszczeniu, równoczesne dołączanie pięciu osób, przesyłanie zaszyfrowanych pakietów, odrzucanie zmienionego nonce oraz limit użycia klucza |
+
+Test integracyjny nie otwiera mikrofonu ani głośników. Odsłuch na żywo wymaga
+fizycznych urządzeń audio i nie jest częścią testów automatycznych.
 
 ## Uruchomienie na jednym komputerze
 
@@ -540,9 +592,8 @@ uwierzytelnienia uczestników.
 
 ## Obecne ograniczenia i dalszy rozwój
 
-- brak wyboru urządzenia wejściowego i wyjściowego w GUI;
-- brak bufora jitter i adaptacyjnego wyrównywania opóźnień;
-- brak prawdziwego miksowania kilku jednoczesnych strumieni PCM;
+- zmiana urządzeń audio wymaga ponownego dołączenia do pokoju;
+- brak adaptacyjnego bufora jitter; kolejka odtwarzania ma stały rozmiar;
 - brak automatycznego odnajdywania serwera w LAN;
 - brak NAT traversal; połączenie przez internet wymaga obecnie dostępnego serwera;
 - brak kont, ról, haseł do pokojów i list kontroli dostępu;
@@ -552,13 +603,12 @@ uwierzytelnienia uczestników.
 
 Naturalna kolejność dalszych prac:
 
-1. bufor jitter i miksowanie wielu rozmówców;
-2. wybór mikrofonu oraz głośników;
+1. adaptacyjny bufor jitter oraz lepsza kompensacja utraty pakietów;
+2. przełączanie mikrofonu i głośników w trakcie rozmowy;
 3. SAS lub QR do weryfikacji kluczy;
-4. testy integracyjne klient–serwer;
-5. serwer dostępny przez internet;
-6. instalator Windows przez `jpackage`;
-7. pomiary opóźnienia, strat pakietów i jakości dźwięku do pracy inżynierskiej.
+4. serwer dostępny przez internet;
+5. instalator Windows przez `jpackage`;
+6. pomiary opóźnienia, strat pakietów i jakości dźwięku do pracy inżynierskiej.
 
 ## Uruchamianie i zatrzymywanie — skrót
 
@@ -578,3 +628,8 @@ Naturalna kolejność dalszych prac:
 
 Serwer zatrzymuje się przez `Ctrl+C`. Klient kończy pracę po użyciu przycisku
 `Rozłącz` i zamknięciu okna.
+
+Awaryjne zamknięcie procesów uruchomionych skryptami tej kopii projektu
+lub jej plikiem EXE: `kill-ciphervoice.bat`. Skrypt sprawdza pełną ścieżkę
+JAR-a lub EXE. Procesy uruchomione ręcznie z względną ścieżką JAR-a należy
+zatrzymać w ich terminalu. Podgląd bez zatrzymywania: `kill-ciphervoice.bat -WhatIf`.

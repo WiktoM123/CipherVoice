@@ -7,6 +7,10 @@ wrappery, sposób uruchamiania oraz dokumentację. Uporządkowano pakiety
 i poprawiono konkretne błędy ujawnione przy analizie. Jest to weryfikacja
 prototypu na podstawie kodu i testów, a nie certyfikacja jego bezpieczeństwa.
 
+Połączono też lokalne zmiany interfejsu z trzema nowszymi commitami GitHuba.
+Aktualna wersja zachowuje protokół v3, losowe nonce AES-GCM, limity użycia
+klucza, miksowanie głosów, testy integracyjne i lokalny wybór urządzeń audio.
+
 ## Struktura i uruchamianie
 
 Wspólny prefiks pakietów to `pl.ciphervoice`. Przykładowa ścieżka serwera:
@@ -17,7 +21,9 @@ server/src/main/java/pl/ciphervoice/server/ControlServer.java
 
 `src/main/java` jest standardowym katalogiem źródeł Mavena. Zmieniono
 deklaracje pakietów, importy, lokalizację testów, groupId oraz klasy startowe.
-Nie zmieniono formatu komunikatów TCP/UDP ani domyślnych portów.
+Domyślne porty pozostały bez zmian. Po scaleniu obowiązuje format pakietów
+UDP protokołu v3; klient i serwer muszą używać zgodnej wersji. Losowy nonce
+ma 12 bajtów i jest częścią uwierzytelnianego nagłówka.
 
 Budowanie w katalogu PRACA:
 
@@ -55,6 +61,7 @@ kod sukcesu mimo błędu Mavena.
 | Zajęty port nie przerywał startu aplikacji | Wiązanie TCP/UDP podczas inicjalizacji komponentów Spring |
 | Diagnostyka zwracała port 0 zamiast przydzielonego portu | Endpoint statusu odczytuje rzeczywiście związane porty TCP/UDP |
 | Odczyt TCP nie miał ograniczenia długości | Czytnik ramek do 16 KiB oraz timeout bezczynności JOIN |
+| Awaryjne zamykanie zatrzymywało dowolny proces na portach aplikacji | Weryfikacja pełnych ścieżek JAR/EXE tej kopii projektu; tryb podglądu `-WhatIf` |
 
 Usunięto też nieużywaną zależność Jackson z common oraz mylące, nieaktywne
 ustawienie wersji JUnit. Zależności testowe nie są dołączane do gotowego
@@ -64,18 +71,22 @@ wygenerowane materiały, bez usuwania istniejących prezentacji.
 ## Wyniki weryfikacji
 
 - Bazowy projekt przed zmianami: 2 testy, wszystkie poprawne.
-- Pełne budowanie `mvnw.cmd clean verify` zakończyło się `BUILD SUCCESS`; po dodaniu poprawki diagnostyki portów wykonano ponownie `mvnw.cmd verify`.
-- Serwer: 20 testów, bez błędów i pominięć.
-- Klient: 15 testów, bez błędów i pominięć.
-- Łącznie: 35 testów JUnit.
+- Pierwszy przegląd zakończył się 35 poprawnymi testami.
+- Po scaleniu i uzgodnieniu walidacji portu 0: `mvnw.cmd verify` zakończyło się `BUILD SUCCESS`.
+- Common: 6 testów, bez błędów i pominięć.
+- Klient: 29 testów, bez błędów i pominięć.
+- Serwer: 31 testów, w tym 4 testy integracyjne z prawdziwymi klientami TCP/UDP; bez błędów i pominięć.
+- Łącznie: 66 testów JUnit.
 - Wrappery i skrypty startowe: 22 scenariusze z atrapą Javy, wszystkie poprawne, w tym ścieżki ze spacjami i propagacja kodu błędu.
+- Wybór procesów do zamknięcia: 6 scenariuszy, bez zatrzymywania rzeczywistych procesów.
 - Gotowy JAR klienta: prawidłowy Main-Class `pl.ciphervoice.client.ClientMain`, brak plików starego pakietu i klas Mockito.
 
-Testy klienta korzystają z atrap, aby nie otwierać mikrofonu ani głośników.
-Testy serwera wykorzystują atrapy oraz porty przydzielane przez system,
+Testy jednostkowe klienta korzystają z atrap, a integracyjne wyłączają audio,
+aby nie otwierać mikrofonu ani głośników. Testy serwera wykorzystują atrapy
+oraz porty przydzielane przez system,
 bez uruchamiania serwera na domyślnych portach użytkownika.
 
-Osobny test na gotowym JAR-ze serwera sprawdził dwa rzeczywiste połączenia
+Przed scaleniem osobny test na gotowym JAR-ze serwera sprawdził dwa rzeczywiste połączenia
 TCP, uzgodnienie X25519, przekazanie i odszyfrowanie koperty klucza, rejestrację
 UDP oraz przekazanie zaszyfrowanych datagramów w obu kierunkach. Sprawdzono
 zmianę lidera i epoki po odejściu uczestnika oraz usunięcie pustego pokoju.
@@ -92,8 +103,8 @@ ani fizycznych urządzeń audio podczas tej aktualizacji.
 ## Ograniczenia istotne dla pracy inżynierskiej
 
 - Brak uwierzytelnionej weryfikacji kluczy rozmówców. Nie należy deklarować odporności na aktywny serwer podmieniający klucze. Model opisany w README zakłada serwer działający zgodnie z protokołem.
-- Brak bufora jitter i pełnego miksowania jednoczesnych rozmówców. Jakość rozmowy wielu osób wymaga rzeczywistego testu audio; samo przekazanie datagramów jej nie potwierdza.
-- Brak wyboru urządzeń, NAT traversal, kont i kontroli dostępu do pokojów.
+- Kolejki odtwarzania mają stały rozmiar do trzech ramek; nie jest to adaptacyjny bufor jitter. Miksowanie dodaje próbki z nasyceniem. Jakość rozmowy wielu osób wymaga rzeczywistego testu audio; samo przekazanie datagramów jej nie potwierdza.
+- Zmiana urządzeń audio wymaga ponownego dołączenia. Brak NAT traversal, kont i kontroli dostępu do pokojów.
 - Limit długości ramek i timeout bezczynności nie zapewniają pełnej odporności na DoS. Nie ma limitu liczby połączeń, rate limitu ani deadline zapisu do klienta.
 
 Przed opisaniem wyników w pracy wykonaj test na co najmniej dwóch komputerach

@@ -287,7 +287,7 @@ class VoiceClientTest {
             WireMessage join = mapper.readValue(controlOutput.toString(StandardCharsets.UTF_8), WireMessage.class);
             CryptoSupport.WrappedKey wrapped = CryptoSupport.wrapGroupKey(key,
                     leaderIdentity.getPrivate(), CryptoSupport.decodePublicKey(join.publicKey),
-                    "voice-key/v1/room/" + epoch + "/" + leader + "/" + self);
+                    "voice-key/v" + Protocol.VERSION + "/room/" + epoch + "/" + leader + "/" + self);
             WireMessage message = WireMessage.of(MessageType.KEY_DISTRIBUTION);
             message.epoch = epoch;
             message.clientId = leader.toString();

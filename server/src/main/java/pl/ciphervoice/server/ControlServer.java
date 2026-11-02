@@ -95,6 +95,7 @@ public class ControlServer {
                         continue;
                     }
                     socket.setTcpNoDelay(true);
+                    socket.setKeepAlive(true);
                     executor.submit(() -> handle(socket));
                 } catch (IOException | RejectedExecutionException exception) {
                     activeSockets.remove(socket);
@@ -151,7 +152,7 @@ public class ControlServer {
                 String line;
                 while ((line = reader.readFrame()) != null) {
                     WireMessage message = mapper.readValue(line, WireMessage.class);
-                    if (message.type == MessageType.KEY_DISTRIBUTION) {
+                    if (message != null && message.type == MessageType.KEY_DISTRIBUTION) {
                         forwardKey(session, message);
                     }
                 }
@@ -186,7 +187,15 @@ public class ControlServer {
     }
 
     void forwardKey(ClientSession sender, WireMessage message) {
-        UUID target = UUID.fromString(message.targetId);
+        if (message.targetId == null || message.epoch == null || !validEnvelope(message)) {
+            return;
+        }
+        UUID target;
+        try {
+            target = UUID.fromString(message.targetId);
+        } catch (IllegalArgumentException exception) {
+            return;
+        }
         int epoch = message.epoch == null ? -1 : message.epoch;
         ClientSession recipient = rooms.distributionTarget(sender, target, epoch);
         if (recipient == null) {
@@ -211,6 +220,21 @@ public class ControlServer {
 
     private void publishMembershipChange(RoomRegistry.Change change) {
         publishMembershipChange(change, null, null);
+    }
+
+    private static boolean validEnvelope(WireMessage message) {
+        if (message.wrapNonce == null || message.wrappedKey == null
+                || message.wrapNonce.length() > 32 || message.wrappedKey.length() > 128) {
+            return false;
+        }
+        try {
+            return Base64.getDecoder().decode(message.wrapNonce).length
+                    == Protocol.GCM_NONCE_BYTES
+                    && Base64.getDecoder().decode(message.wrappedKey).length
+                    == Protocol.WRAPPED_KEY_BYTES;
+        } catch (IllegalArgumentException exception) {
+            return false;
+        }
     }
 
     private void publishMembershipChange(RoomRegistry.Change change, ClientSession joining,
