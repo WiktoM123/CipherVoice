@@ -1,4 +1,6 @@
 target/
+dist/
+.codex-presentations/
 .idea/
 .vscode/
 *.iml

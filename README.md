@@ -46,10 +46,23 @@ Projekt ma trzy moduły Maven:
 
 ```text
 CipherVoice
-├── common   wspólne komunikaty i stałe protokołu
-├── server   serwer Spring Boot, pokoje, TCP i przekaźnik UDP
-└── client   JavaFX, audio, Opus, kryptografia i komunikacja sieciowa
+├── common/src/main/java/pl/ciphervoice/common/
+├── server/src/main/java/pl/ciphervoice/server/
+├── server/src/main/resources/application.properties
+├── client/src/main/java/pl/ciphervoice/client/
+├── client/src/main/resources/voice.css
+├── client/src/test/java/pl/ciphervoice/client/
+├── server/src/test/java/pl/ciphervoice/server/
+├── start-server.cmd
+└── start-client.cmd
 ```
+
+Pakiety kodu mają wspólny prefiks `pl.ciphervoice`, zgodny z nazwą aplikacji.
+Moduł `common` zawiera komunikaty i stałe protokołu, `server` obsługuje pokoje
+oraz TCP/UDP, a `client` zawiera interfejs, audio i kryptografię. Katalogi
+`src/main/java`, `src/main/resources` i `src/test/java` są standardowym układem
+Mavena. Nie trzeba ich skracać ani podawać pełnej ścieżki z dysku, żeby
+zbudować lub uruchomić aplikację.
 
 Połączenia wyglądają następująco:
 
@@ -197,6 +210,7 @@ Każdy komunikat TCP jest jedną linią JSON.
 | `VoiceServerApplication.java` | główna metoda uruchamiająca Spring Boot |
 | `VoiceServerProperties.java` | odczyt portów `voice.control-port` i `voice.udp-port` |
 | `ControlServer.java` | nasłuchiwanie TCP, `JOIN`, rozgłaszanie stanu i przekazywanie kopert klucza |
+| `ControlFrameReader.java` | odczyt ramek TCP z limitem 16 KiB |
 | `RoomRegistry.java` | pokoje, uczestnicy, lider, epoka i sprawdzanie uprawnień |
 | `ClientSession.java` | stan pojedynczego połączenia klienta po stronie serwera |
 | `UdpRelayServer.java` | rejestracja adresów UDP, walidacja i przekazywanie audio |
@@ -214,6 +228,7 @@ Każdy komunikat TCP jest jedną linią JSON.
 | `VoiceClientListener.java` | zdarzenia przekazywane z logiki sieciowej do GUI |
 | `OpusVoiceEngine.java` | mikrofon, głośniki, kodowanie i dekodowanie Opus, pomiar głośności |
 | `CryptoSupport.java` | X25519, HKDF-SHA-256, AES-GCM i generowanie kluczy |
+| `EpochCryptoContext.java` | klucz danej epoki, niezależny licznik pakietów i ochrona przed powtórzeniami |
 | `AudioPacketCodec.java` | budowanie, szyfrowanie, odczyt i odszyfrowanie datagramów |
 | `CryptoSupportTest.java` | test kopert klucza oraz wykrywania modyfikacji szyfrogramu |
 
@@ -227,6 +242,14 @@ Najczęstsze miejsca zmian:
 - obsługa TCP: `ControlServer.java`;
 - przekazywanie UDP: `UdpRelayServer.java`;
 - porty: `server/src/main/resources/application.properties`.
+
+Testy klienta znajdują się w `client/src/test/java/pl/ciphervoice/client`,
+a serwera w `server/src/test/java/pl/ciphervoice/server`. Obejmują między
+innymi zmianę epoki podczas wysyłania i odbioru, powtórne koperty klucza,
+walidację X25519, kolejność publikowania zmian pokoju i zwalnianie zasobów.
+
+Opis przeglądu kodu i granic wykonanej weryfikacji:
+[docs/PRZEGLAD_PROJEKTU.md](docs/PRZEGLAD_PROJEKTU.md).
 
 ## Wymagania
 
@@ -285,6 +308,12 @@ Uruchomienie testów bez pakowania:
 .\mvnw.cmd test
 ```
 
+Pełne sprawdzenie i utworzenie paczek od zera:
+
+```powershell
+.\mvnw.cmd clean verify
+```
+
 ## Uruchomienie na jednym komputerze
 
 Otwórz dwa okna PowerShell w katalogu projektu.
@@ -292,14 +321,20 @@ Otwórz dwa okna PowerShell w katalogu projektu.
 Terminal 1 — serwer:
 
 ```powershell
-java -jar server\target\server-0.1.0-SNAPSHOT.jar
+.\start-server.cmd
 ```
 
 Terminal 2 — klient:
 
 ```powershell
-java -jar client\target\CipherVoice.jar
+.\start-client.cmd
 ```
+
+Skrypty wskazują pliki JAR względem własnego katalogu, więc działają również
+po przeniesieniu całego projektu w inne miejsce. Można też nadal używać
+`java -jar server\target\server-0.1.0-SNAPSHOT.jar` oraz
+`java -jar client\target\CipherVoice.jar`. Dodatkowe argumenty skryptów są
+przekazywane aplikacji, np. `start-server.cmd --server.port=8082`.
 
 W oknie klienta wpisz:
 
@@ -400,11 +435,14 @@ Polecenie zostało uruchomione w złym katalogu. Z katalogu głównego projektu 
 java -jar client\target\CipherVoice.jar
 ```
 
-Jeśli plik leży na Pulpicie, podaj pełną ścieżkę:
+Najprościej uruchomić klienta skryptem z katalogu projektu:
 
 ```powershell
-java -jar "C:\Users\PC\Desktop\CipherVoice.jar"
+.\start-client.cmd
 ```
+
+Jeżeli skopiowano sam JAR na drugi komputer, uruchom terminal w katalogu
+tego pliku i użyj `java -jar CipherVoice.jar`.
 
 ### `Port already in use` / port jest zajęty
 
@@ -447,8 +485,9 @@ Sprawdź:
 ### Ostrzeżenie `Unsupported JavaFX configuration`
 
 To ostrzeżenie wynika z umieszczenia JavaFX i zależności w jednym dużym JAR-ze.
-Nie zatrzymuje aplikacji i nie wpływa na szyfrowanie. Docelowy instalator
-`jpackage` z własnym runtime usunie tę niedogodność.
+Jeśli okno klienta uruchamia się prawidłowo, samo to ostrzeżenie nie oznacza
+błędu protokołu szyfrowania. Utworzenie paczki EXE nie gwarantuje usunięcia
+ostrzeżenia o konfiguracji JavaFX.
 
 ## Model bezpieczeństwa
 
@@ -473,6 +512,19 @@ Serwer widzi metadane potrzebne do działania:
 - czas i częstotliwość przesyłania datagramów.
 
 Nie widzi klucza grupowego ani odszyfrowanej zawartości rozmowy.
+
+### Zmiana klucza i odporność obsługi protokołu
+
+Klucz, licznik wysyłanych pakietów i lista odebranych numerów sekwencyjnych
+należą do osobnego kontekstu każdej epoki. Opóźniona ramka poprzedniej epoki
+nie zmienia stanu nowego kontekstu. Powtórzenie koperty klucza lub żądania
+rekey tej samej aktywnej epoki nie zeruje licznika.
+
+Serwer publikuje zmiany składu pokoju w kolejności epok i sprawdza klucze
+X25519 przed dodaniem uczestnika. Nieaktualna koperta klucza nie rozłącza
+lidera. Przy dołączaniu obowiązuje 10-sekundowy timeout bezczynności odczytu,
+a pojedyncza ramka TCP może mieć do 16 KiB. Nie są to pełne mechanizmy
+ochrony przed przeciążeniem: prototyp nie ma limitu liczby sesji ani rate limitu.
 
 ### Ważne ograniczenie: aktywny MITM
 
@@ -515,10 +567,10 @@ Naturalna kolejność dalszych prac:
 .\mvnw.cmd clean package
 
 # serwer
-java -jar server\target\server-0.1.0-SNAPSHOT.jar
+.\start-server.cmd
 
 # klient
-java -jar client\target\CipherVoice.jar
+.\start-client.cmd
 
 # testy
 .\mvnw.cmd test

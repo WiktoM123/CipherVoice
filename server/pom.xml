@@ -4,15 +4,15 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
     <parent>
-        <groupId>pl.edu.voice</groupId>
-        <artifactId>e2ee-voice-chat</artifactId>
+        <groupId>pl.ciphervoice</groupId>
+        <artifactId>ciphervoice</artifactId>
         <version>0.1.0-SNAPSHOT</version>
     </parent>
     <artifactId>server</artifactId>
 
     <dependencies>
         <dependency>
-            <groupId>pl.edu.voice</groupId>
+            <groupId>pl.ciphervoice</groupId>
             <artifactId>common</artifactId>
             <version>${project.version}</version>
         </dependency>
