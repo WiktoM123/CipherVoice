@@ -34,6 +34,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
@@ -176,6 +177,35 @@ class VoiceClientTest {
         }
     }
 
+    @Test
+    void udpPingComputesRttFromMatchingPongNonceAndIgnoresWrongNonce() throws Exception {
+        try (Session session = new Session(false, false)) {
+            session.start();
+            session.client.sendPing();
+            long nonce = session.lastPingNonce.get();
+            assertTrue(nonce != 0 || session.pingCount.get() == 1);
+
+            byte[] wrongPong = ByteBuffer.allocate(Protocol.PONG_DATAGRAM_BYTES)
+                    .putInt(Protocol.PONG_MAGIC)
+                    .put(Protocol.VERSION)
+                    .putLong(nonce ^ 1L)
+                    .array();
+            session.incoming.add(wrongPong);
+
+            byte[] validPong = ByteBuffer.allocate(Protocol.PONG_DATAGRAM_BYTES)
+                    .putInt(Protocol.PONG_MAGIC)
+                    .put(Protocol.VERSION)
+                    .putLong(nonce)
+                    .array();
+            session.incoming.add(validPong);
+
+            Long rtt = session.pings.poll(5, TimeUnit.SECONDS);
+            assertNotNull(rtt);
+            assertTrue(rtt >= 1);
+            assertTrue(session.pings.isEmpty());
+        }
+    }
+
     private static long sequence(byte[] packet) {
         return ByteBuffer.wrap(packet).getLong(Integer.BYTES + 1 + 2 * Long.BYTES
                 + 2 * Integer.BYTES);
@@ -195,6 +225,9 @@ class VoiceClientTest {
         private final BlockingQueue<byte[]> outgoing = new LinkedBlockingQueue<>();
         private final BlockingQueue<Integer> roomEvents = new LinkedBlockingQueue<>();
         private final BlockingQueue<EncryptionEvent> encryptionEvents = new LinkedBlockingQueue<>();
+        private final BlockingQueue<Long> pings = new LinkedBlockingQueue<>();
+        private final AtomicLong lastPingNonce = new AtomicLong();
+        private final AtomicInteger pingCount = new AtomicInteger();
         private final AtomicReference<Consumer<byte[]>> audioSender = new AtomicReference<>();
         private final CountDownLatch disconnected = new CountDownLatch(1);
         private final AtomicInteger disconnectCount = new AtomicInteger();
@@ -220,8 +253,13 @@ class VoiceClientTest {
                     DatagramPacket packet = invocation.getArgument(0);
                     byte[] data = Arrays.copyOfRange(packet.getData(), packet.getOffset(),
                             packet.getOffset() + packet.getLength());
-                    if (ByteBuffer.wrap(data).getInt() == Protocol.AUDIO_MAGIC) {
+                    int magic = ByteBuffer.wrap(data).getInt();
+                    if (magic == Protocol.AUDIO_MAGIC) {
                         outgoing.add(data);
+                    } else if (magic == Protocol.PING_MAGIC && data.length == Protocol.PING_DATAGRAM_BYTES) {
+                        long nonce = ByteBuffer.wrap(data).getLong(Protocol.PING_DATAGRAM_BYTES - Long.BYTES);
+                        lastPingNonce.set(nonce);
+                        pingCount.incrementAndGet();
                     }
                     return null;
                 }).when(socket).send(any(DatagramPacket.class));
@@ -251,6 +289,11 @@ class VoiceClientTest {
                         @Override
                         public void onEncryptionChanged(boolean ready, int epoch) {
                             encryptionEvents.add(new EncryptionEvent(ready, epoch));
+                        }
+
+                        @Override
+                        public void onPingUpdated(long rttMs) {
+                            pings.add(rttMs);
                         }
 
                         @Override

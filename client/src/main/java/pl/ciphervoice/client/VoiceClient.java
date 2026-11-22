@@ -20,6 +20,7 @@ import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
 import java.security.KeyPair;
@@ -37,6 +38,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BooleanSupplier;
@@ -64,8 +66,10 @@ final class VoiceClient implements AutoCloseable {
     private final CountDownLatch welcomed = new CountDownLatch(1);
     private final Object stateLock = new Object();
     private final Object lifecycleLock = new Object();
+    private final Object pingLock = new Object();
     private final Mixer.Info microphoneMixer;
     private final Mixer.Info speakerMixer;
+    private final Map<UUID, Double> participantVolumes = new ConcurrentHashMap<>();
 
     private volatile Socket controlSocket;
     private BufferedWriter controlWriter;
@@ -80,6 +84,19 @@ final class VoiceClient implements AutoCloseable {
     private volatile byte[] relayToken;
     private volatile EpochCryptoContext cryptoContext;
     private volatile String lastServerError;
+    private volatile double microphoneGain = 1.0;
+    private volatile double noiseGateThreshold = 0.0;
+    private volatile double masterVolume = 1.0;
+    private volatile boolean manualMuted;
+    private volatile boolean pttEnabled;
+    private volatile boolean pttPressed;
+    private volatile boolean deafened;
+    private final String identityFingerprint;
+    private volatile PacketPreview lastOutgoingPacket;
+    private volatile PacketPreview lastIncomingPacket;
+    private long pendingPingNonce;
+    private long pendingPingSentNanos;
+    private boolean hasPendingPing;
 
     VoiceClient(String host, int controlPort, int udpPort, String room, String nickname,
                 VoiceClientListener listener) throws Exception {
@@ -109,6 +126,7 @@ final class VoiceClient implements AutoCloseable {
         this.audioEnabled = audioEnabled;
         this.listener = listener == null ? new VoiceClientListener() { } : listener;
         this.identity = CryptoSupport.newIdentityKeyPair();
+        this.identityFingerprint = CryptoSupport.fingerprintHex(identity.getPublic().getEncoded(), 12);
         this.microphoneMixer = microphoneMixer;
         this.speakerMixer = speakerMixer;
     }
@@ -174,6 +192,7 @@ final class VoiceClient implements AutoCloseable {
                 OpusVoiceEngine engine = new OpusVoiceEngine(this::sendAudio,
                         listener::onLocalAudioLevel, listener::onParticipantAudioLevel,
                         listener::onError, microphoneMixer, speakerMixer);
+                applyAudioConfig(engine);
                 audio = engine;
                 try {
                     engine.start();
@@ -516,6 +535,7 @@ final class VoiceClient implements AutoCloseable {
                 return;
             }
             byte[] encrypted = currentKey.encrypt(sender, senderTag, opus);
+            lastOutgoingPacket = capturePacketPreview(encrypted, currentKey.epoch());
             socket.send(new DatagramPacket(encrypted, encrypted.length, relayAddress));
         } catch (Exception exception) {
             // A single lost datagram must not interrupt the conversation.
@@ -530,6 +550,9 @@ final class VoiceClient implements AutoCloseable {
                 DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
                 socket.receive(packet);
                 byte[] data = java.util.Arrays.copyOf(packet.getData(), packet.getLength());
+                if (handlePong(data)) {
+                    continue;
+                }
 
                 EpochCryptoContext currentKey = cryptoContext;
                 if (currentKey == null || AudioPacketCodec.peekEpoch(data) != currentKey.epoch()) {
@@ -545,6 +568,8 @@ final class VoiceClient implements AutoCloseable {
                             || !currentKey.accept(decoded)) {
                         continue;
                     }
+                    currentKey.recordDecrypted();
+                    lastIncomingPacket = capturePacketPreview(data, currentKey.epoch());
                 }
                 OpusVoiceEngine engine = audio;
                 if (engine != null) {
@@ -557,7 +582,59 @@ final class VoiceClient implements AutoCloseable {
     }
 
     private void registrationLoop() {
-        retryRegistration(running::get, this::registerUdp, () -> Thread.sleep(3_000));
+        retryRegistration(running::get, this::registerAndPing, () -> Thread.sleep(2_000));
+    }
+
+    private void registerAndPing() throws IOException {
+        registerUdp();
+        sendPing();
+    }
+
+    void sendPing() throws IOException {
+        DatagramSocket socket = udpSocket;
+        UUID id = clientId;
+        byte[] token = relayToken;
+        InetSocketAddress relay = relayAddress;
+        if (socket == null || id == null || token == null || relay == null) {
+            return;
+        }
+        long nonce = ThreadLocalRandom.current().nextLong();
+        synchronized (pingLock) {
+            pendingPingNonce = nonce;
+            pendingPingSentNanos = System.nanoTime();
+            hasPendingPing = true;
+        }
+        byte[] payload = ByteBuffer.allocate(Protocol.PING_DATAGRAM_BYTES)
+                .putInt(Protocol.PING_MAGIC)
+                .put(Protocol.VERSION)
+                .putLong(id.getMostSignificantBits())
+                .putLong(id.getLeastSignificantBits())
+                .put(token)
+                .putLong(nonce)
+                .array();
+        socket.send(new DatagramPacket(payload, payload.length, relay));
+    }
+
+    private boolean handlePong(byte[] data) {
+        if (data.length != Protocol.PONG_DATAGRAM_BYTES) {
+            return false;
+        }
+        ByteBuffer buffer = ByteBuffer.wrap(data);
+        if (buffer.getInt() != Protocol.PONG_MAGIC || buffer.get() != Protocol.VERSION) {
+            return false;
+        }
+        long nonce = buffer.getLong();
+        long sentNanos;
+        synchronized (pingLock) {
+            if (!hasPendingPing || pendingPingNonce != nonce) {
+                return true;
+            }
+            hasPendingPing = false;
+            sentNanos = pendingPingSentNanos;
+        }
+        long rttMs = Math.max(1L, Math.round((System.nanoTime() - sentNanos) / 1_000_000.0));
+        listener.onPingUpdated(rttMs);
+        return true;
     }
 
     static void retryRegistration(BooleanSupplier running, IoAction register,
@@ -640,14 +717,71 @@ final class VoiceClient implements AutoCloseable {
         listener.onEncryptionChanged(ready, currentEpoch);
     }
 
+    private void applyAudioConfig(OpusVoiceEngine engine) {
+        engine.setMicrophoneGain(microphoneGain);
+        engine.setNoiseGateThreshold(noiseGateThreshold);
+        engine.setMasterVolume(masterVolume);
+        engine.setPushToTalk(pttEnabled, pttPressed);
+        engine.setMuted(manualMuted);
+        engine.setDeafened(deafened);
+        for (Map.Entry<UUID, Double> entry : participantVolumes.entrySet()) {
+            engine.setParticipantVolume(entry.getKey(), entry.getValue());
+        }
+    }
+
     void setMuted(boolean muted) {
+        this.manualMuted = muted;
         OpusVoiceEngine engine = audio;
         if (engine != null) {
             engine.setMuted(muted);
         }
     }
 
+    void setPushToTalk(boolean enabled, boolean pressed) {
+        this.pttEnabled = enabled;
+        this.pttPressed = pressed;
+        OpusVoiceEngine engine = audio;
+        if (engine != null) {
+            engine.setPushToTalk(enabled, pressed);
+        }
+    }
+
+    void setMicrophoneGain(double gain) {
+        this.microphoneGain = gain;
+        OpusVoiceEngine engine = audio;
+        if (engine != null) {
+            engine.setMicrophoneGain(gain);
+        }
+    }
+
+    void setNoiseGateThreshold(double threshold) {
+        this.noiseGateThreshold = threshold;
+        OpusVoiceEngine engine = audio;
+        if (engine != null) {
+            engine.setNoiseGateThreshold(threshold);
+        }
+    }
+
+    void setMasterVolume(double volume) {
+        this.masterVolume = volume;
+        OpusVoiceEngine engine = audio;
+        if (engine != null) {
+            engine.setMasterVolume(volume);
+        }
+    }
+
+    void setParticipantVolume(UUID participantId, double volume) {
+        if (participantId != null) {
+            participantVolumes.put(participantId, volume);
+        }
+        OpusVoiceEngine engine = audio;
+        if (engine != null) {
+            engine.setParticipantVolume(participantId, volume);
+        }
+    }
+
     void setDeafened(boolean deafened) {
+        this.deafened = deafened;
         OpusVoiceEngine engine = audio;
         if (engine != null) {
             engine.setDeafened(deafened);
@@ -722,6 +856,54 @@ final class VoiceClient implements AutoCloseable {
         String message = exception.getMessage();
         return message == null || message.isBlank()
                 ? exception.getClass().getSimpleName() : message;
+    }
+
+    private static PacketPreview capturePacketPreview(byte[] datagram, int packetEpoch) {
+        if (datagram == null || datagram.length < Protocol.MIN_AUDIO_DATAGRAM_BYTES) {
+            return null;
+        }
+        String nonceHex = CryptoSupport.toSpacedHex(
+                datagram, Protocol.AUDIO_HEADER_BYTES - Protocol.GCM_NONCE_BYTES - Short.BYTES,
+                Protocol.GCM_NONCE_BYTES);
+        int cipherLen = datagram.length - Protocol.AUDIO_HEADER_BYTES;
+        String cipherHex = CryptoSupport.toSpacedHex(
+                datagram, Protocol.AUDIO_HEADER_BYTES, Math.min(14, cipherLen));
+        if (cipherLen > 14) {
+            cipherHex += " …";
+        }
+        return new PacketPreview(datagram.length, packetEpoch, nonceHex, cipherHex);
+    }
+
+    EncryptionSnapshot encryptionSnapshot() {
+        EpochCryptoContext ctx = cryptoContext;
+        return new EncryptionSnapshot(
+                ctx != null ? ctx.epoch() : epoch,
+                ctx != null,
+                identityFingerprint,
+                ctx != null ? ctx.keyFingerprint() : "—",
+                ctx != null ? ctx.encryptedCount() : 0L,
+                ctx != null ? ctx.decryptedCount() : 0L,
+                controlPort,
+                udpPort,
+                lastOutgoingPacket,
+                lastIncomingPacket
+        );
+    }
+
+    record PacketPreview(int totalBytes, int epoch, String nonceHex, String ciphertextHex) {
+    }
+
+    record EncryptionSnapshot(
+            int epoch,
+            boolean active,
+            String identityFingerprint,
+            String groupKeyFingerprint,
+            long encryptedPackets,
+            long decryptedPackets,
+            int controlPort,
+            int udpPort,
+            PacketPreview lastOutgoing,
+            PacketPreview lastIncoming) {
     }
 
 }

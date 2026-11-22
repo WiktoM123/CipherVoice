@@ -17,6 +17,7 @@ import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -231,6 +232,22 @@ class CryptoSupportTest {
         assertArrayEquals(opus, AudioPacketCodec.decrypt(packet, key).opus());
         assertThrows(IllegalArgumentException.class, () -> AudioPacketCodec.encrypt(
                 UUID.randomUUID(), 1, 100, 1, new byte[maxOpusBytes + 1], key));
+    }
+
+    @Test
+    void fingerprintsAreDeterministicForEqualKeysAndFormattedAsHexPairs() {
+        SecretKeySpec first = CryptoSupport.newGroupKey();
+        SecretKeySpec copy = new SecretKeySpec(first.getEncoded(), "AES");
+        SecretKeySpec other = CryptoSupport.newGroupKey();
+
+        String fp1 = CryptoSupport.fingerprintHex(first.getEncoded(), 12);
+        String fp2 = CryptoSupport.fingerprintHex(copy.getEncoded(), 12);
+        String fpOther = CryptoSupport.fingerprintHex(other.getEncoded(), 12);
+
+        assertEquals(fp1, fp2);
+        assertEquals(12 * 2 + 11, fp1.length());
+        assertNotEquals(fp1, fpOther);
+        assertEquals("0A FF 10", CryptoSupport.toSpacedHex(new byte[]{0x0A, (byte) 0xFF, 0x10}, 0, 3));
     }
 
     private static byte[] packetNonce(byte[] packet) {

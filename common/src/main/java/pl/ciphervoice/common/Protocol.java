@@ -5,6 +5,8 @@ public final class Protocol {
     public static final byte VERSION = 3;
     public static final int AUDIO_MAGIC = 0x564F4950; // VOIP
     public static final int REGISTER_MAGIC = 0x56435247; // VCRG
+    public static final int PING_MAGIC = 0x56435047; // VCPG
+    public static final int PONG_MAGIC = 0x5643504F; // VCPO
     public static final int RELAY_TOKEN_BYTES = 16;
     public static final int GROUP_KEY_BYTES = 32;
     public static final int GCM_TAG_BITS = 128;
@@ -21,6 +23,10 @@ public final class Protocol {
             AUDIO_HEADER_BYTES + GCM_TAG_BYTES;
     public static final int REGISTER_DATAGRAM_BYTES =
             4 + 1 + 16 + RELAY_TOKEN_BYTES;
+    public static final int PING_DATAGRAM_BYTES =
+            4 + 1 + 16 + RELAY_TOKEN_BYTES + Long.BYTES;
+    public static final int PONG_DATAGRAM_BYTES =
+            4 + 1 + Long.BYTES;
     /** Maximum length of one newline-delimited JSON control message. */
     public static final int MAX_CONTROL_LINE_CHARS = 65_536;
     /** X25519 public keys encoded as Base64 X.509 are about 60 characters. */

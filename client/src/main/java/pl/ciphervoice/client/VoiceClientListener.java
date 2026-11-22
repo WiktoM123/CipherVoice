@@ -21,6 +21,9 @@ interface VoiceClientListener {
     default void onParticipantAudioLevel(UUID participantId, double level) {
     }
 
+    default void onPingUpdated(long rttMs) {
+    }
+
     default void onError(String message) {
     }
 

@@ -38,6 +38,7 @@ final class OpusVoiceEngine implements AutoCloseable {
     private static final int MAX_QUEUED_FRAMES = 3;
     private static final int MAX_OPUS_PACKET_BYTES = 1276;
     private static final int LINE_BUFFER_BYTES = FRAME_BYTES * 4;
+    static final int NOISE_GATE_HANGOVER_FRAMES = 15; // 300 ms at 20 ms/frame
     private static final System.Logger log =
             System.getLogger(OpusVoiceEngine.class.getName());
 
@@ -52,10 +53,16 @@ final class OpusVoiceEngine implements AutoCloseable {
     private final Mixer.Info microphoneMixer;
     private final Mixer.Info speakerMixer;
     private final Map<UUID, ParticipantAudio> participants = new ConcurrentHashMap<>();
+    private final Map<UUID, Double> participantVolumes = new ConcurrentHashMap<>();
     private final AtomicBoolean running = new AtomicBoolean();
     private final AtomicBoolean muted = new AtomicBoolean();
+    private final AtomicBoolean pttEnabled = new AtomicBoolean();
+    private final AtomicBoolean pttPressed = new AtomicBoolean();
     private final AtomicBoolean deafened = new AtomicBoolean();
     private final AtomicBoolean closed = new AtomicBoolean();
+    private volatile double microphoneGain = 1.0;
+    private volatile double noiseGateThreshold = 0.0;
+    private volatile double masterVolume = 1.0;
     private final Object lifecycleLock = new Object();
     private volatile TargetDataLine microphone;
     private volatile SourceDataLine speakers;
@@ -180,6 +187,7 @@ final class OpusVoiceEngine implements AutoCloseable {
     void removeParticipant(UUID participantId) {
         if (participantId != null) {
             participants.remove(participantId);
+            participantVolumes.remove(participantId);
         }
     }
 
@@ -194,6 +202,7 @@ final class OpusVoiceEngine implements AutoCloseable {
 
             byte[] pcmBytes = new byte[FRAME_BYTES];
             byte[] opusBuffer = new byte[MAX_OPUS_PACKET_BYTES];
+            NoiseGate gate = new NoiseGate(NOISE_GATE_HANGOVER_FRAMES);
             int levelFrame = 0;
             while (running.get()) {
                 int read = readFrame(input, pcmBytes);
@@ -204,10 +213,14 @@ final class OpusVoiceEngine implements AutoCloseable {
                     break;
                 }
                 short[] pcm = littleEndianToShorts(pcmBytes);
+                applyGain(pcm, pcm.length, microphoneGain);
+                double level = audioLevel(pcm, pcm.length);
+                boolean transmitMuted = isTransmitMuted();
+                boolean gateOpen = !transmitMuted && gate.accept(level, noiseGateThreshold);
                 if (++levelFrame % 3 == 0) {
-                    levelConsumer.accept(muted.get() ? 0.0 : audioLevel(pcm, pcm.length));
+                    levelConsumer.accept(gateOpen ? level : 0.0);
                 }
-                if (muted.get()) {
+                if (!gateOpen) {
                     continue;
                 }
                 int encoded = encoder.encode(pcm, 0, FRAME_SAMPLES,
@@ -226,17 +239,20 @@ final class OpusVoiceEngine implements AutoCloseable {
     }
 
     private void playbackLoop(SourceDataLine output) {
+        int[] accum = new int[FRAME_SAMPLES * CHANNELS];
         short[] mixed = new short[FRAME_SAMPLES * CHANNELS];
         byte[] mixedBytes = new byte[FRAME_BYTES];
         try {
             while (running.get()) {
-                Arrays.fill(mixed, (short) 0);
-                for (ParticipantAudio participant : participants.values()) {
-                    short[] frame = participant.poll();
+                Arrays.fill(accum, 0);
+                for (Map.Entry<UUID, ParticipantAudio> entry : participants.entrySet()) {
+                    short[] frame = entry.getValue().poll();
                     if (frame != null) {
-                        mixInto(mixed, frame);
+                        double peerVolume = participantVolumes.getOrDefault(entry.getKey(), 1.0);
+                        mixInto(accum, frame, peerVolume);
                     }
                 }
+                finalizeMixed(accum, mixed, masterVolume);
                 shortsToLittleEndian(mixed, mixedBytes);
                 output.write(mixedBytes, 0, mixedBytes.length);
             }
@@ -251,18 +267,68 @@ final class OpusVoiceEngine implements AutoCloseable {
         }
     }
 
-    private static void mixInto(short[] target, short[] source) {
-        int count = Math.min(target.length, source.length);
-        for (int i = 0; i < count; i++) {
-            int sum = target[i] + source[i];
-            target[i] = (short) Math.max(Short.MIN_VALUE, Math.min(Short.MAX_VALUE, sum));
+    static void applyGain(short[] pcm, int count, double gain) {
+        if (Math.abs(gain - 1.0) < 1e-6) {
+            return;
         }
+        double clampedGain = Math.max(0.0, Math.min(4.0, gain));
+        for (int i = 0; i < count; i++) {
+            long scaled = Math.round(pcm[i] * clampedGain);
+            pcm[i] = (short) Math.max(Short.MIN_VALUE, Math.min(Short.MAX_VALUE, scaled));
+        }
+    }
+
+    static void mixInto(int[] target, short[] source, double gain) {
+        int count = Math.min(target.length, source.length);
+        double clampedGain = Math.max(0.0, Math.min(2.0, gain));
+        for (int i = 0; i < count; i++) {
+            target[i] += (int) Math.round(source[i] * clampedGain);
+        }
+    }
+
+    static void finalizeMixed(int[] source, short[] target, double masterGain) {
+        int count = Math.min(source.length, target.length);
+        double clampedMaster = Math.max(0.0, Math.min(2.0, masterGain));
+        for (int i = 0; i < count; i++) {
+            long scaled = Math.round(source[i] * clampedMaster);
+            target[i] = (short) Math.max(Short.MIN_VALUE, Math.min(Short.MAX_VALUE, scaled));
+        }
+    }
+
+    boolean isTransmitMuted() {
+        return muted.get() || (pttEnabled.get() && !pttPressed.get());
     }
 
     void setMuted(boolean value) {
         muted.set(value);
-        if (value) {
+        if (isTransmitMuted()) {
             levelConsumer.accept(0.0);
+        }
+    }
+
+    void setPushToTalk(boolean enabled, boolean pressed) {
+        pttEnabled.set(enabled);
+        pttPressed.set(pressed);
+        if (isTransmitMuted()) {
+            levelConsumer.accept(0.0);
+        }
+    }
+
+    void setMicrophoneGain(double gain) {
+        microphoneGain = Math.max(0.25, Math.min(3.0, gain));
+    }
+
+    void setNoiseGateThreshold(double threshold) {
+        noiseGateThreshold = Math.max(0.0, Math.min(0.5, threshold));
+    }
+
+    void setMasterVolume(double volume) {
+        masterVolume = Math.max(0.0, Math.min(2.0, volume));
+    }
+
+    void setParticipantVolume(UUID participantId, double volume) {
+        if (participantId != null) {
+            participantVolumes.put(participantId, Math.max(0.0, Math.min(2.0, volume)));
         }
     }
 
@@ -275,7 +341,7 @@ final class OpusVoiceEngine implements AutoCloseable {
         }
     }
 
-    private static double audioLevel(short[] pcm, int count) {
+    static double audioLevel(short[] pcm, int count) {
         if (count <= 0) {
             return 0.0;
         }
@@ -385,6 +451,34 @@ final class OpusVoiceEngine implements AutoCloseable {
 
         private synchronized void clear() {
             frames.clear();
+        }
+    }
+
+    /**
+     * Stateful voice-activity gate with hangover so quiet speech endings are not clipped.
+     */
+    static final class NoiseGate {
+        private final int hangoverFrames;
+        private int remainingHangover;
+
+        NoiseGate(int hangoverFrames) {
+            this.hangoverFrames = Math.max(0, hangoverFrames);
+        }
+
+        boolean accept(double level, double threshold) {
+            if (threshold <= 0.0) {
+                remainingHangover = 0;
+                return true;
+            }
+            if (level >= threshold) {
+                remainingHangover = hangoverFrames;
+                return true;
+            }
+            if (remainingHangover > 0) {
+                remainingHangover--;
+                return true;
+            }
+            return false;
         }
     }
 }

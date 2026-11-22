@@ -89,6 +89,8 @@ public class UdpRelayServer {
             int magic = input.getInt();
             if (magic == Protocol.REGISTER_MAGIC) {
                 register(packet, input);
+            } else if (magic == Protocol.PING_MAGIC) {
+                pong(relay, packet, input);
             } else if (magic == Protocol.AUDIO_MAGIC) {
                 relayAudio(relay, packet, input);
             }
@@ -97,10 +99,9 @@ public class UdpRelayServer {
         }
     }
 
-    private void register(DatagramPacket packet, ByteBuffer input) {
-        if (packet.getLength() != Protocol.REGISTER_DATAGRAM_BYTES
-                || input.get() != Protocol.VERSION) {
-            return;
+    private ClientSession authenticateControlDatagram(ByteBuffer input) {
+        if (input.get() != Protocol.VERSION) {
+            return null;
         }
         UUID id = new UUID(input.getLong(), input.getLong());
         byte[] token = new byte[Protocol.RELAY_TOKEN_BYTES];
@@ -108,7 +109,42 @@ public class UdpRelayServer {
         ClientSession client = rooms.find(id);
         if (client != null && client.room != null
                 && MessageDigest.isEqual(client.relayToken, token)) {
+            return client;
+        }
+        return null;
+    }
+
+    private void register(DatagramPacket packet, ByteBuffer input) {
+        if (packet.getLength() != Protocol.REGISTER_DATAGRAM_BYTES) {
+            return;
+        }
+        ClientSession client = authenticateControlDatagram(input);
+        if (client != null) {
             client.udpAddress = new InetSocketAddress(packet.getAddress(), packet.getPort());
+        }
+    }
+
+    private void pong(DatagramSocket relay, DatagramPacket packet, ByteBuffer input) {
+        if (packet.getLength() != Protocol.PING_DATAGRAM_BYTES) {
+            return;
+        }
+        ClientSession client = authenticateControlDatagram(input);
+        if (client == null) {
+            return;
+        }
+        InetSocketAddress source = new InetSocketAddress(packet.getAddress(), packet.getPort());
+        client.udpAddress = source;
+        long nonce = input.getLong();
+        byte[] response = ByteBuffer.allocate(Protocol.PONG_DATAGRAM_BYTES)
+                .putInt(Protocol.PONG_MAGIC)
+                .put(Protocol.VERSION)
+                .putLong(nonce)
+                .array();
+        try {
+            relay.send(new DatagramPacket(response, response.length, source));
+        } catch (IOException exception) {
+            log.trace("Nie udało się odesłać odpowiedzi PONG do {}: {}",
+                    client.id, exception.getMessage());
         }
     }
 

@@ -170,6 +170,36 @@ final class CryptoSupport {
         return result == 0;
     }
 
+    static String fingerprintHex(byte[] data, int maxBytes) {
+        if (data == null || data.length == 0 || maxBytes <= 0) {
+            return "—";
+        }
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256").digest(data);
+            return formatHex(digest, 0, Math.min(maxBytes, digest.length), ":");
+        } catch (GeneralSecurityException exception) {
+            throw new IllegalStateException("Brak algorytmu SHA-256", exception);
+        }
+    }
+
+    static String toSpacedHex(byte[] data, int offset, int length) {
+        if (data == null || offset < 0 || offset >= data.length || length <= 0) {
+            return "—";
+        }
+        return formatHex(data, offset, Math.min(length, data.length - offset), " ");
+    }
+
+    private static String formatHex(byte[] data, int offset, int count, String separator) {
+        StringBuilder sb = new StringBuilder(count * (2 + separator.length()));
+        for (int i = 0; i < count; i++) {
+            if (i > 0) {
+                sb.append(separator);
+            }
+            sb.append(String.format("%02X", data[offset + i]));
+        }
+        return sb.toString();
+    }
+
     record WrappedKey(String nonce, String ciphertext) {
     }
 }

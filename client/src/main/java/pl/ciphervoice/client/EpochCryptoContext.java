@@ -13,7 +13,9 @@ final class EpochCryptoContext {
     private final int epoch;
     private final SecretKeySpec key;
     private final long packetLimit;
+    private final String keyFingerprint;
     private final AtomicLong encryptedPackets = new AtomicLong();
+    private final AtomicLong decryptedPackets = new AtomicLong();
     private final AtomicLong nextSequence = new AtomicLong();
     private final Map<UUID, Long> receivedSequences = new HashMap<>();
 
@@ -26,6 +28,7 @@ final class EpochCryptoContext {
         this.key = key;
         this.packetLimit = Protocol.MAX_RANDOM_NONCE_ENCRYPTIONS_PER_KEY
                 / Math.max(1, participants);
+        this.keyFingerprint = CryptoSupport.fingerprintHex(key.getEncoded(), 12);
     }
 
     int epoch() {
@@ -38,6 +41,22 @@ final class EpochCryptoContext {
 
     long packetLimit() {
         return packetLimit;
+    }
+
+    String keyFingerprint() {
+        return keyFingerprint;
+    }
+
+    long encryptedCount() {
+        return Math.min(encryptedPackets.get(), packetLimit);
+    }
+
+    long decryptedCount() {
+        return decryptedPackets.get();
+    }
+
+    void recordDecrypted() {
+        decryptedPackets.incrementAndGet();
     }
 
     long claimEncryption() {
