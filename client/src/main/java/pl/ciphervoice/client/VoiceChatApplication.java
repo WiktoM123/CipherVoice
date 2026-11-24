@@ -81,6 +81,7 @@ public class VoiceChatApplication extends Application {
     private Label connectionLabel;
     private Label pingLabel;
     private Label encryptionLabel;
+    private Label sasLabel;
     private Label epochLabel;
     private Label roomSubtitle;
     private Label errorBanner;
@@ -99,6 +100,8 @@ public class VoiceChatApplication extends Application {
     private volatile UUID leaderId;
     private volatile int currentEpoch;
     private volatile boolean encryptionReady;
+    private volatile VoiceClient.SasSnapshot latestSas =
+            VoiceClient.SasSnapshot.unavailable("Oczekiwanie na połączenie");
     private volatile String latestStatus = "Połączono";
     private volatile String pendingError;
     private String connectedHost;
@@ -392,6 +395,7 @@ public class VoiceChatApplication extends Application {
         leaderId = null;
         currentEpoch = 0;
         encryptionReady = false;
+        latestSas = VoiceClient.SasSnapshot.unavailable("Oczekiwanie na klucz grupowy…");
         latestStatus = "Łączenie…";
         pendingError = null;
         connect.setDisable(true);
@@ -488,6 +492,12 @@ public class VoiceChatApplication extends Application {
         epochLabel = new Label("Epoka " + currentEpoch);
         epochLabel.getStyleClass().add("epoch-badge");
 
+        sasLabel = new Label();
+        sasLabel.getStyleClass().add("sas-badge");
+        sasLabel.setOnMouseClicked(e -> showSasVerificationDialog());
+        VoiceClient activeClient = client;
+        updateSasBadge(activeClient != null ? activeClient.sasSnapshot() : latestSas);
+
         encryptionLabel = new Label(encryptionReady ? "🔒 E2EE aktywne" : "Uzgadnianie klucza…");
         encryptionLabel.getStyleClass().add(
                 encryptionReady ? "encryption-ready" : "encryption-waiting");
@@ -495,8 +505,37 @@ public class VoiceChatApplication extends Application {
                 "Kliknij, aby zobaczyć odciski kluczy i podgląd szyfrowanych pakietów"));
         encryptionLabel.setOnMouseClicked(e -> showEncryptionInspectorDialog());
 
-        header.getChildren().addAll(names, fill, pingLabel, epochLabel, encryptionLabel);
+        header.getChildren().addAll(names, fill, pingLabel, epochLabel, sasLabel, encryptionLabel);
         return header;
+    }
+
+    private void updateSasBadge(VoiceClient.SasSnapshot snapshot) {
+        if (snapshot != null) {
+            latestSas = snapshot;
+        }
+        if (sasLabel == null) {
+            return;
+        }
+        sasLabel.getStyleClass().removeAll("sas-pending", "sas-unverified", "sas-verified");
+        if (snapshot == null || !snapshot.available()) {
+            sasLabel.setText("SAS: —");
+            sasLabel.getStyleClass().add("sas-pending");
+            String problem = snapshot == null || snapshot.problem() == null
+                    ? "SAS pojawi się po uzgodnieniu klucza grupowego"
+                    : snapshot.problem();
+            sasLabel.setTooltip(new Tooltip(problem));
+        } else if (snapshot.verified()) {
+            sasLabel.setText("SAS ✓ " + snapshot.code());
+            sasLabel.getStyleClass().add("sas-verified");
+            sasLabel.setTooltip(new Tooltip(
+                    "Kod został potwierdzony lokalnie. Kliknij, aby zobaczyć szczegóły."));
+        } else {
+            sasLabel.setText("SAS: " + snapshot.code());
+            sasLabel.getStyleClass().add("sas-unverified");
+            sasLabel.setTooltip(new Tooltip(
+                    "Porównaj ten kod z innymi uczestnikami poza CipherVoice, "
+                            + "a następnie kliknij, aby go zatwierdzić."));
+        }
     }
 
     private Node createParticipantsPanel() {
@@ -612,6 +651,7 @@ public class VoiceChatApplication extends Application {
         connectionLabel = null;
         pingLabel = null;
         encryptionLabel = null;
+        sasLabel = null;
         epochLabel = null;
         roomSubtitle = null;
         errorBanner = null;
@@ -1102,6 +1142,141 @@ public class VoiceChatApplication extends Application {
         dialog.showAndWait();
     }
 
+    private void showSasVerificationDialog() {
+        VoiceClient activeClient = client;
+        if (activeClient == null) {
+            return;
+        }
+        Stage dialog = new Stage();
+        dialog.initOwner(stage);
+        dialog.initModality(Modality.WINDOW_MODAL);
+        dialog.setTitle("Weryfikacja SAS — CipherVoice");
+
+        VBox content = new VBox(15);
+        content.getStyleClass().add("settings-card");
+        content.setPrefWidth(600);
+
+        Label title = new Label("🔐 Weryfikacja SAS");
+        title.getStyleClass().add("card-title");
+
+        Label subtitle = new Label(
+                "SAS to krótki kod wyliczany lokalnie z klucza grupowego, pokoju, epoki, "
+                        + "lidera i pełnej listy uczestników. Porównaj go z innymi osobami "
+                        + "poza CipherVoice — osobiście lub innym komunikatorem. "
+                        + "Zgodność oznacza, że serwer nie podmienił kluczy.");
+        subtitle.getStyleClass().add("muted-label");
+        subtitle.setWrapText(true);
+
+        Label codeValue = new Label("—");
+        codeValue.getStyleClass().add("sas-code");
+        codeValue.setAlignment(Pos.CENTER);
+        codeValue.setMaxWidth(Double.MAX_VALUE);
+
+        Label status = new Label();
+        status.getStyleClass().add("sas-dialog-status");
+        status.setWrapText(true);
+        status.setMaxWidth(Double.MAX_VALUE);
+        status.setAlignment(Pos.CENTER);
+
+        Label details = new Label();
+        details.getStyleClass().add("muted-label");
+        details.setWrapText(true);
+        details.setMaxWidth(Double.MAX_VALUE);
+
+        VBox codeBox = new VBox(10, codeValue, status, details);
+        codeBox.getStyleClass().add("settings-section");
+        codeBox.setAlignment(Pos.CENTER);
+
+        Label warning = new Label(
+                "Ten kod nie jest wysyłany do serwera. Także status „zweryfikowano” "
+                        + "pozostaje wyłącznie na tym komputerze. Po zmianie klucza, epoki "
+                        + "lub składu pokoju kod i status resetują się automatycznie.");
+        warning.getStyleClass().add("sas-hint");
+        warning.setWrapText(true);
+
+        Button verify = new Button("Oznacz jako zweryfikowany");
+        verify.getStyleClass().add("primary-button");
+        verify.setMinWidth(Region.USE_PREF_SIZE);
+
+        Button close = new Button("Zamknij");
+        close.getStyleClass().add("control-button");
+        close.setMinWidth(Region.USE_PREF_SIZE);
+        close.setOnAction(e -> dialog.close());
+
+        HBox actions = new HBox(10, verify, close);
+        actions.setAlignment(Pos.CENTER_RIGHT);
+
+        Runnable refresh = () -> {
+            VoiceClient current = client;
+            if (current != activeClient) {
+                dialog.close();
+                return;
+            }
+            VoiceClient.SasSnapshot snapshot = current.sasSnapshot();
+            latestSas = snapshot;
+            verify.getStyleClass().removeAll("sas-verify-done");
+
+            if (!snapshot.available()) {
+                codeValue.setText("—");
+                details.setText("");
+                status.getStyleClass().removeAll(
+                        "sas-status-ok", "sas-status-wait", "sas-status-error");
+                status.getStyleClass().add("sas-status-wait");
+                status.setText(snapshot.problem() == null
+                        ? "Oczekiwanie na klucz grupowy…" : snapshot.problem());
+                verify.setDisable(true);
+                verify.setText("Oczekiwanie na klucz…");
+                return;
+            }
+
+            codeValue.setText(snapshot.code());
+            details.setText("Pokój #" + connectedRoom
+                    + "   •   epoka " + snapshot.epoch()
+                    + "   •   uczestnicy: " + snapshot.participants());
+            status.getStyleClass().removeAll(
+                    "sas-status-ok", "sas-status-wait", "sas-status-error");
+            if (snapshot.verified()) {
+                status.getStyleClass().add("sas-status-ok");
+                status.setText("✓ Zweryfikowano lokalnie");
+                verify.setDisable(true);
+                verify.setText("✓ Zweryfikowano");
+                verify.getStyleClass().add("sas-verify-done");
+            } else {
+                status.getStyleClass().add("sas-status-wait");
+                status.setText("⚠ Niezweryfikowany — porównaj kod z pozostałymi osobami");
+                verify.setDisable(false);
+                verify.setText("Oznacz jako zweryfikowany");
+            }
+        };
+        refresh.run();
+
+        verify.setOnAction(e -> {
+            VoiceClient current = client;
+            if (current == activeClient && current.setSasVerified(true)) {
+                refresh.run();
+            }
+        });
+
+        Timeline refresher = new Timeline(new KeyFrame(Duration.millis(300), e -> refresh.run()));
+        refresher.setCycleCount(Timeline.INDEFINITE);
+        refresher.play();
+        dialog.setOnHidden(e -> refresher.stop());
+
+        content.getChildren().addAll(new VBox(4, title, subtitle), codeBox, warning, actions);
+
+        Scene scene = new Scene(content);
+        scene.setFill(Color.web("#131832"));
+        scene.getStylesheets().add(getClass().getResource("/voice.css").toExternalForm());
+        var dialogIconStream = getClass().getResourceAsStream("/icon.png");
+        if (dialogIconStream != null) {
+            dialog.getIcons().add(new javafx.scene.image.Image(dialogIconStream));
+        }
+        dialog.setScene(scene);
+        dialog.setResizable(false);
+        WindowsThemeSupport.enableDarkTitleBar(dialog.getTitle());
+        dialog.showAndWait();
+    }
+
     private static String formatPacketPreview(VoiceClient.PacketPreview preview, String fallback) {
         if (preview == null) {
             return fallback;
@@ -1438,6 +1613,22 @@ public class VoiceChatApplication extends Application {
                         "encryption-ready", "encryption-waiting");
                 encryptionLabel.getStyleClass().add(
                         ready ? "encryption-ready" : "encryption-waiting");
+            });
+        }
+
+        @Override
+        public void onSasChanged(VoiceClient.SasSnapshot snapshot) {
+            if (!current()) {
+                return;
+            }
+            Platform.runLater(() -> {
+                if (!current()) {
+                    return;
+                }
+                // The callback is only a hint; always show the latest local state so
+                // a slightly older notification cannot overwrite a fresh verification.
+                VoiceClient active = client;
+                updateSasBadge(active != null ? active.sasSnapshot() : snapshot);
             });
         }
 

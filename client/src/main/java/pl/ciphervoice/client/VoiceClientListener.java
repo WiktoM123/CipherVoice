@@ -15,6 +15,9 @@ interface VoiceClientListener {
     default void onEncryptionChanged(boolean ready, int epoch) {
     }
 
+    default void onSasChanged(VoiceClient.SasSnapshot snapshot) {
+    }
+
     default void onLocalAudioLevel(double level) {
     }
 

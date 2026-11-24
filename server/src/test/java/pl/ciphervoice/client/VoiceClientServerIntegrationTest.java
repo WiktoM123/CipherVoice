@@ -26,6 +26,7 @@ import java.util.function.BooleanSupplier;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -49,6 +50,7 @@ class VoiceClientServerIntegrationTest {
             Recorder aliceEvents = new Recorder();
             VoiceClient alice = new VoiceClient("127.0.0.1", controlPort, udpPort,
                     "pokoj", "Alice", aliceEvents, false);
+            aliceEvents.attach(alice);
             try {
                 alice.start();
                 await(() -> aliceEvents.ready && aliceEvents.epoch == 1, 5_000,
@@ -60,7 +62,9 @@ class VoiceClientServerIntegrationTest {
                 Recorder bobEvents = new Recorder();
                 VoiceClient bob = new VoiceClient("127.0.0.1", controlPort, udpPort,
                         "pokoj", "Bob", bobEvents, false);
+                bobEvents.attach(bob);
                 byte[] keyBeforeLeaving;
+                String sasBeforeLeaving;
                 try {
                     bob.start();
                     await(() -> aliceEvents.ready && aliceEvents.epoch == 2, 5_000,
@@ -77,6 +81,22 @@ class VoiceClientServerIntegrationTest {
                             "Obaj uczestnicy muszą mieć ten sam klucz grupowy");
                     assertFalse(Arrays.equals(firstKey, aliceKey),
                             "Nowy uczestnik musi wymusić nowy klucz");
+
+                    await(() -> sasReady(aliceEvents, 2) && sasReady(bobEvents, 2), 5_000,
+                            "SAS nie został wyliczony po uzgodnieniu klucza");
+                    sasBeforeLeaving = aliceEvents.sas.code();
+                    assertEquals(sasBeforeLeaving, bobEvents.sas.code(),
+                            "Obaj uczestnicy muszą widzieć ten sam SAS");
+                    assertEquals(2, aliceEvents.sas.participants());
+                    assertFalse(aliceEvents.sas.verified());
+                    assertFalse(bobEvents.sas.verified());
+
+                    assertTrue(alice.setSasVerified(true));
+                    await(() -> aliceEvents.sas.verified(), 2_000,
+                            "Alice nie zapisała lokalnego statusu SAS");
+                    assertFalse(bobEvents.sas.verified(),
+                            "Status weryfikacji nie może być wysyłany do innych klientów");
+
                     assertNull(aliceEvents.error);
                     assertNull(bobEvents.error);
                 } finally {
@@ -85,10 +105,18 @@ class VoiceClientServerIntegrationTest {
 
                 await(() -> aliceEvents.ready && aliceEvents.epoch >= 3, 5_000,
                         "Alice nie przeszła do epoki 3 po wyjściu Boba");
+                await(() -> sasReady(aliceEvents, 3), 5_000,
+                        "Alice nie wyliczyła SAS dla nowej epoki");
                 byte[] rotatedKey = groupKey(alice);
                 assertNotNull(rotatedKey);
                 assertFalse(Arrays.equals(keyBeforeLeaving, rotatedKey),
                         "Klucz powinien zostać zmieniony po wyjściu uczestnika");
+                VoiceClient.SasSnapshot finalSas = aliceEvents.sas;
+                assertNotEquals(sasBeforeLeaving, finalSas.code(),
+                        "Nowa epoka musi zmienić SAS");
+                assertFalse(finalSas.verified(),
+                        "Zmiana epoki musi wyczyścić lokalny status weryfikacji");
+                assertEquals(1, finalSas.participants());
                 assertNull(aliceEvents.error);
             } finally {
                 alice.close();
@@ -354,15 +382,32 @@ class VoiceClientServerIntegrationTest {
         throw new IllegalStateException("Nie udało się znaleźć wolnego portu UDP");
     }
 
+    private static boolean sasReady(Recorder recorder, int epoch) {
+        VoiceClient.SasSnapshot snapshot = recorder.sas;
+        return snapshot != null && snapshot.available() && snapshot.epoch() >= epoch;
+    }
+
     private static final class Recorder implements VoiceClientListener {
         private volatile boolean ready;
         private volatile int epoch = -1;
         private volatile String error;
+        private volatile VoiceClient.SasSnapshot sas;
+        private volatile VoiceClient client;
+
+        void attach(VoiceClient client) {
+            this.client = client;
+        }
 
         @Override
         public void onEncryptionChanged(boolean ready, int epoch) {
             this.ready = ready;
             this.epoch = epoch;
+        }
+
+        @Override
+        public void onSasChanged(VoiceClient.SasSnapshot snapshot) {
+            VoiceClient source = client;
+            this.sas = source == null ? snapshot : source.sasSnapshot();
         }
 
         @Override

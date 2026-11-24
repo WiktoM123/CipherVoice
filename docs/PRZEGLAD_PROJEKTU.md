@@ -102,7 +102,7 @@ ani fizycznych urządzeń audio podczas tej aktualizacji.
 
 ## Ograniczenia istotne dla pracy inżynierskiej
 
-- Brak uwierzytelnionej weryfikacji kluczy rozmówców. Nie należy deklarować odporności na aktywny serwer podmieniający klucze. Model opisany w README zakłada serwer działający zgodnie z protokołem.
+- Weryfikacja kluczy opiera się na lokalnym sześciocyfrowym SAS porównywanym przez użytkowników. Nie ma commit-reveal ani trwałych tożsamości, więc nie należy deklarować automatycznej odporności na aktywny serwer podmieniający klucze: SAS wykrywa podmianę tylko po faktycznym porównaniu kodu. Model opisany w README nadal zakłada serwer działający zgodnie z protokołem do chwili weryfikacji.
 - Kolejki odtwarzania mają stały rozmiar do trzech ramek; nie jest to adaptacyjny bufor jitter. Miksowanie dodaje próbki z nasyceniem. Jakość rozmowy wielu osób wymaga rzeczywistego testu audio; samo przekazanie datagramów jej nie potwierdza.
 - Zmiana urządzeń audio wymaga ponownego dołączenia. Brak NAT traversal, kont i kontroli dostępu do pokojów.
 - Limit długości ramek i timeout bezczynności nie zapewniają pełnej odporności na DoS. Nie ma limitu liczby połączeń, rate limitu ani deadline zapisu do klienta.
@@ -112,3 +112,30 @@ ze słuchawkami. Sprawdź rozmowę dwóch osób, jednoczesne mówienie kilku os�
 dołączanie i opuszczanie pokoju, zmianę lidera, odłączenie sieci i ponowne
 uruchomienie serwera. Zmierz opóźnienie audio, straty pakietów i zachowanie
 przy zmiennych opóźnieniach. Wyniki tych eksperymentów trzeba uzyskać osobno.
+
+## Aktualizacja 24.11.2026: weryfikacja SAS
+
+Dodano lokalną weryfikację klucza grupowego sześciocyfrowym kodem SAS.
+Nowa klasa `SasVerification` wyprowadza kod przez HKDF-SHA-256 z klucza
+grupowego oraz jednoznacznego transkryptu: wersja, pokój, epoka, lider i wszyscy
+uczestnicy posortowani po UUID. Każdy wpis zawiera `clientId`, nickname, klucz
+publiczny X25519 i `senderTag`. Kod jest wyświetlany w nagłówku pokoju oraz
+w oknie weryfikacji; użytkownik potwierdza zgodność lokalnie przyciskiem.
+SAS i status weryfikacji nie są wysyłane przez serwer i nie zmieniają protokołu
+TCP/UDP. Zmiana klucza, epoki, lidera lub składu pokoju resetuje status.
+
+Wyniki po tej zmianie:
+
+- `SasVerificationTest`: 6 testów jednostkowych — stały wektor, niezależność od
+  kolejności listy, zmiana klucza/epoki/pokoju/lidera, zmiana pól uczestnika,
+  zmiana składu oraz odrzucanie niepełnych i dwuznacznych danych.
+- Test integracyjny z prawdziwym serwerem i dwoma klientami sprawdza, że obaj
+  widzą ten sam SAS, że potwierdzenie jednego klienta nie zmienia stanu
+  drugiego i że po odejściu uczestnika kod oraz status weryfikacji się resetują.
+- `mvnw.cmd test`: 81 testów, 0 błędów i 0 pominięć (common 6, klient 43,
+  serwer 32, w tym 4 testy integracyjne).
+
+Ograniczenia SAS: sześć cyfr to około 20 bitów (szansa przypadkowej zgodności
+około 1 na 1 000 000), jest to jeden kod dla całego pokoju, brak commit-reveal
+i trwałych kluczy tożsamości. Ochrona działa tylko wtedy, gdy użytkownicy
+naprawdę porównają kod poza kanałem.

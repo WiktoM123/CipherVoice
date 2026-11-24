@@ -83,6 +83,11 @@ final class VoiceClient implements AutoCloseable {
     private volatile int epoch;
     private volatile byte[] relayToken;
     private volatile EpochCryptoContext cryptoContext;
+    private volatile SasSnapshot sas = SasSnapshot.unavailable(
+            "SAS pojawi się po uzgodnieniu klucza grupowego");
+    /** Local confirmation only; guarded by {@link #stateLock}. */
+    private String verifiedSasCode;
+    private int verifiedSasEpoch = -1;
     private volatile String lastServerError;
     private volatile double microphoneGain = 1.0;
     private volatile double noiseGateThreshold = 0.0;
@@ -330,9 +335,19 @@ final class VoiceClient implements AutoCloseable {
             if (newEpoch < epoch) {
                 return;
             }
-            if (newEpoch > epoch) {
+            boolean epochChanged = newEpoch > epoch;
+            boolean rosterChanged = !members.equals(newMembers);
+            boolean leaderChanged = leaderId == null
+                    ? newLeader != null : !leaderId.equals(newLeader);
+            if (epochChanged) {
                 epoch = newEpoch;
                 cryptoContext = null;
+            }
+            if (epochChanged || rosterChanged || leaderChanged) {
+                verifiedSasCode = null;
+                verifiedSasEpoch = -1;
+                sas = SasSnapshot.unavailable(
+                        "Zmiana klucza lub składu pokoju — ponowne uzgadnianie SAS…");
             }
             leaderId = newLeader;
             removed.addAll(members.keySet());
@@ -387,6 +402,7 @@ final class VoiceClient implements AutoCloseable {
             }
         }
         listener.onEncryptionChanged(true, requestedEpoch);
+        publishSas();
         if (!failed.isEmpty()) {
             listener.onError("Nie udało się przekazać klucza do: "
                     + String.join(", ", failed));
@@ -460,6 +476,7 @@ final class VoiceClient implements AutoCloseable {
             return false;
         }
         listener.onEncryptionChanged(true, acceptedEpoch);
+        publishSas();
         return true;
     }
 
@@ -703,6 +720,7 @@ final class VoiceClient implements AutoCloseable {
         UUID leader;
         int currentEpoch;
         boolean ready;
+        SasSnapshot sasSnapshot;
         synchronized (stateLock) {
             snapshot = members.values().stream()
                     .sorted(Comparator.comparing(MemberInfo::nickname,
@@ -712,9 +730,89 @@ final class VoiceClient implements AutoCloseable {
             leader = leaderId;
             currentEpoch = epoch;
             ready = cryptoContext != null && cryptoContext.epoch() == currentEpoch;
+            sasSnapshot = computeSasLocked();
+            sas = sasSnapshot;
         }
         listener.onRoomState(snapshot, self, leader, currentEpoch);
         listener.onEncryptionChanged(ready, currentEpoch);
+        listener.onSasChanged(sasSnapshot);
+    }
+
+    /** Recomputes and publishes SAS after the group key was installed or removed. */
+    private void publishSas() {
+        SasSnapshot snapshot;
+        synchronized (stateLock) {
+            snapshot = computeSasLocked();
+            sas = snapshot;
+        }
+        listener.onSasChanged(snapshot);
+    }
+
+    /**
+     * Must be called with {@link #stateLock} held. Verification is bound to the
+     * exact code and epoch the user confirmed, so a new key, epoch or roster
+     * automatically invalidates it.
+     */
+    private SasSnapshot computeSasLocked() {
+        EpochCryptoContext context = cryptoContext;
+        UUID self = clientId;
+        UUID leader = leaderId;
+        int currentEpoch = epoch;
+        if (context == null || context.epoch() != currentEpoch) {
+            return SasSnapshot.unavailable("Oczekiwanie na klucz grupowy…");
+        }
+        if (self == null || leader == null) {
+            return SasSnapshot.unavailable("Brak pełnych danych pokoju do wyliczenia SAS");
+        }
+        MemberInfo selfMember = members.get(self);
+        String ownPublicKey = CryptoSupport.encodePublicKey(identity.getPublic());
+        if (selfMember == null || !ownPublicKey.equals(selfMember.publicKey())
+                || selfMember.senderTag() != senderTag) {
+            return SasSnapshot.unavailable(
+                    "Lista uczestników nie zgadza się z tożsamością tego klienta");
+        }
+        try {
+            String code = SasVerification.compute(
+                    context.key(), room, currentEpoch, leader, members.values());
+            boolean verified = code.equals(verifiedSasCode) && currentEpoch == verifiedSasEpoch;
+            return new SasSnapshot(code, true, verified, currentEpoch, members.size(), null);
+        } catch (GeneralSecurityException | IllegalArgumentException exception) {
+            return SasSnapshot.unavailable(
+                    "Nie można wyliczyć SAS: " + messageOf(exception));
+        }
+    }
+
+    /** Returns the latest locally computed SAS; never transmitted to the server. */
+    SasSnapshot sasSnapshot() {
+        return sas;
+    }
+
+    /**
+     * Marks the current SAS as verified locally. Returns {@code false} when no
+     * code is available yet. This state is never sent through the network.
+     */
+    boolean setSasVerified(boolean verified) {
+        SasSnapshot snapshot;
+        boolean accepted = true;
+        synchronized (stateLock) {
+            snapshot = computeSasLocked();
+            if (verified) {
+                if (snapshot.available()) {
+                    verifiedSasCode = snapshot.code();
+                    verifiedSasEpoch = snapshot.epoch();
+                    snapshot = new SasSnapshot(snapshot.code(), true, true,
+                            snapshot.epoch(), snapshot.participants(), null);
+                } else {
+                    accepted = false;
+                }
+            } else {
+                verifiedSasCode = null;
+                verifiedSasEpoch = -1;
+            }
+            sas = snapshot;
+        }
+        listener.onSasChanged(snapshot);
+        return accepted;
     }
 
     private void applyAudioConfig(OpusVoiceEngine engine) {
@@ -891,6 +989,23 @@ final class VoiceClient implements AutoCloseable {
     }
 
     record PacketPreview(int totalBytes, int epoch, String nonceHex, String ciphertextHex) {
+    }
+
+    /**
+     * Local SAS state. {@code available} is false before the group key is known
+     * or when the roster cannot be trusted; {@code problem} explains why.
+     */
+    record SasSnapshot(
+            String code,
+            boolean available,
+            boolean verified,
+            int epoch,
+            int participants,
+            String problem) {
+
+        static SasSnapshot unavailable(String problem) {
+            return new SasSnapshot("—", false, false, -1, 0, problem);
+        }
     }
 
     record EncryptionSnapshot(

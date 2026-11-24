@@ -154,6 +154,78 @@
 .encryption-ready:hover { -fx-background-color: rgba(55, 210, 143, 0.26); -fx-border-color: rgba(75, 230, 165, 0.72); }
 .encryption-waiting { -fx-background-color: rgba(255, 190, 73, 0.18); -fx-border-color: rgba(255, 190, 73, 0.38); -fx-border-radius: 999; -fx-text-fill: #ffd47d; -fx-cursor: hand; }
 
+.sas-badge {
+    -fx-padding: 7 13 7 13;
+    -fx-background-radius: 999;
+    -fx-border-radius: 999;
+    -fx-font-family: "Consolas", "Courier New", monospace;
+    -fx-font-size: 12px;
+    -fx-font-weight: 700;
+    -fx-cursor: hand;
+}
+
+.sas-badge.sas-pending {
+    -fx-background-color: #1c2347;
+    -fx-border-color: rgba(135, 150, 230, 0.24);
+    -fx-text-fill: #aab7d4;
+}
+
+.sas-badge.sas-unverified {
+    -fx-background-color: rgba(255, 190, 73, 0.18);
+    -fx-border-color: rgba(255, 190, 73, 0.42);
+    -fx-text-fill: #ffd47d;
+}
+
+.sas-badge.sas-unverified:hover {
+    -fx-background-color: rgba(255, 190, 73, 0.28);
+    -fx-border-color: rgba(255, 205, 105, 0.75);
+}
+
+.sas-badge.sas-verified {
+    -fx-background-color: rgba(55, 210, 143, 0.16);
+    -fx-border-color: rgba(55, 210, 143, 0.42);
+    -fx-text-fill: #7cf0b9;
+}
+
+.sas-badge.sas-verified:hover {
+    -fx-background-color: rgba(55, 210, 143, 0.26);
+    -fx-border-color: rgba(75, 230, 165, 0.72);
+}
+
+.sas-code {
+    -fx-font-family: "Consolas", "Courier New", monospace;
+    -fx-font-size: 42px;
+    -fx-font-weight: 800;
+    -fx-text-fill: #ffffff;
+    -fx-padding: 8 22 8 22;
+    -fx-background-color: #0d1226;
+    -fx-background-radius: 12;
+    -fx-border-color: rgba(135, 150, 230, 0.35);
+    -fx-border-radius: 12;
+}
+
+.sas-dialog-status {
+    -fx-font-size: 13.5px;
+    -fx-font-weight: 700;
+}
+
+.sas-dialog-status.sas-status-ok { -fx-text-fill: #7cf0b9; }
+.sas-dialog-status.sas-status-wait { -fx-text-fill: #ffd47d; }
+.sas-dialog-status.sas-status-error { -fx-text-fill: #ffb3bf; }
+
+.sas-hint {
+    -fx-text-fill: #9fb0d1;
+    -fx-font-size: 12px;
+    -fx-line-spacing: 3;
+}
+
+.sas-verify-done {
+    -fx-background-color: rgba(55, 210, 143, 0.18);
+    -fx-border-color: rgba(55, 210, 143, 0.42);
+    -fx-border-radius: 9;
+    -fx-text-fill: #7cf0b9;
+}
+
 .mono-readout {
     -fx-font-family: "Consolas", "Courier New", monospace;
     -fx-font-size: 12.5px;

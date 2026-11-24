@@ -4,7 +4,8 @@ Desktopowy komunikator głosowy do rozmów grupowych z szyfrowaniem end-to-end
 (E2EE).
 
 Serwer pośredniczy w zestawieniu pokoju i przekazuje pakiety audio, ale nie
-otrzymuje grupowego klucza AES ani dźwięku w postaci jawnej.
+otrzymuje grupowego klucza AES ani dźwięku w postaci jawnej. Nie otrzymuje też
+kodu SAS ani lokalnego statusu weryfikacji uczestników.
 
 ## Co obecnie działa
 
@@ -17,6 +18,7 @@ otrzymuje grupowego klucza AES ani dźwięku w postaci jawnej.
 - szyfrowanie audio AES-256-GCM;
 - uzgadnianie kluczy przy użyciu X25519 i HKDF-SHA-256;
 - automatyczna zmiana klucza po dołączeniu lub opuszczeniu pokoju;
+- lokalna weryfikacja klucza sześciocyfrowym kodem SAS;
 - ochrona przed ponownym odtworzeniem starego pakietu;
 - niezależne wyciszanie mikrofonu i odsłuchu;
 - wybór mikrofonu i głośników oraz test urządzeń w ustawieniach audio;
@@ -40,6 +42,7 @@ otrzymuje grupowego klucza AES ani dźwięku w postaci jawnej.
 | Szyfrowanie | AES-256-GCM | poufność i integralność audio oraz kopert klucza |
 | Uzgadnianie | X25519 | wspólny sekret między dwiema instancjami klienta |
 | Wyprowadzanie | HKDF-SHA-256 | utworzenie klucza do zabezpieczenia klucza grupowego |
+| Weryfikacja | SAS + HKDF-SHA-256 | sześciocyfrowy kod porównywany poza kanałem |
 | JSON | Jackson | serializacja komunikatów TCP |
 | Budowanie | Maven Wrapper | kompilacja bez osobnej instalacji Mavena |
 
@@ -264,6 +267,7 @@ Każdy komunikat TCP jest jedną linią JSON.
 | `voice.css` | kolory, rozmiary, podświetlenia i wygląd JavaFX |
 | `VoiceClient.java` | koordynacja TCP, UDP, stanu pokoju, epok i klucza grupowego |
 | `VoiceClientListener.java` | zdarzenia przekazywane z logiki sieciowej do GUI |
+| `SasVerification.java` | lokalne wyliczanie sześciocyfrowego kodu SAS z klucza i składu pokoju |
 | `OpusVoiceEngine.java` | mikrofon, głośniki, kodowanie i dekodowanie Opus, pomiar głośności |
 | `CryptoSupport.java` | X25519, HKDF-SHA-256, AES-GCM i generowanie kluczy |
 | `EpochCryptoContext.java` | klucz danej epoki, niezależny licznik pakietów i ochrona przed powtórzeniami |
@@ -354,14 +358,14 @@ Pełne sprawdzenie i utworzenie paczek od zera:
 ```
 ### Testy automatyczne
 
-Projekt zawiera 66 testów jednostkowych i integracyjnych:
+Projekt zawiera 81 testów jednostkowych i integracyjnych:
 
 | Moduł | Zakres |
 |---|---|
 | `common` | walidacja nazw, limit linii JSON, kodowanie kluczy X25519 |
-| `client` | HKDF, koperty klucza, losowe 12-bajtowe nonce, niezależne odszyfrowanie GCM, uwierzytelnianie nagłówka i odrzucanie błędnych pakietów |
+| `client` | HKDF, koperty klucza, losowe 12-bajtowe nonce, niezależne odszyfrowanie GCM, uwierzytelnianie nagłówka i odrzucanie błędnych pakietów; SAS: stały wektor, kolejność listy, zmiana klucza/epoki/pokoju/lidera/składu |
 | `server` | pokoje, lider, epoki, uprawnienia do dystrybucji klucza, przekaźnik UDP |
-| `server` (integracja) | prawdziwy serwer TCP/UDP i klienci z wyłączonym audio: wspólny klucz epoki, rotacja po dołączeniu/opuszczeniu, równoczesne dołączanie pięciu osób, przesyłanie zaszyfrowanych pakietów, odrzucanie zmienionego nonce oraz limit użycia klucza |
+| `server` (integracja) | prawdziwy serwer TCP/UDP i klienci z wyłączonym audio: wspólny klucz epoki, rotacja po dołączeniu/opuszczeniu, równoczesne dołączanie pięciu osób, przesyłanie zaszyfrowanych pakietów, odrzucanie zmienionego nonce, limit użycia klucza, wspólny SAS dwóch klientów i reset statusu po zmianie epoki |
 
 Test integracyjny nie otwiera mikrofonu ani głośników. Odsłuch na żywo wymaga
 fizycznych urządzeń audio i nie jest częścią testów automatycznych.
@@ -401,6 +405,24 @@ UDP:      8091
 Można uruchomić drugi klient, ale oba procesy będą korzystać z urządzeń audio
 tego samego komputera, co może powodować echo. Prawidłowy test głosu najlepiej
 wykonać na dwóch komputerach i w słuchawkach.
+
+### Szybka demonstracja SAS
+
+SAS można pokazać bez mikrofonu i głośników:
+
+1. Uruchom serwer i dwa okna klienta.
+2. W obu wpisz ten sam pokój, różne nickname'y i połącz się.
+3. W nagłówku pokoju pojawi się `SAS: 123 456`. Poczekaj, aż oba okna pokażą
+   kod (przy dołączaniu drugiej osoby potrzebna jest nowa epoka i nowy klucz).
+4. Porównaj kody. Powinny być identyczne.
+5. Kliknij badge SAS w jednym oknie i wybierz **„Oznacz jako zweryfikowany”**.
+   Badge zmieni się na zielony `SAS ✓ 123 456` tylko w tym oknie.
+6. Zamknij jednego klienta. Pozostały klient przejdzie do nowej epoki, dostanie
+   nowy kod, a status weryfikacji wróci do żółtego.
+
+Jeśli kody się różnią, nie należy ufać połączeniu: to sygnał możliwej podmiany
+kluczy przez serwer. Kod jest przeznaczony do porównania poza CipherVoice,
+np. osobiście albo innym komunikatorem.
 
 ## Uruchomienie na dwóch komputerach w jednej sieci
 
@@ -551,6 +573,7 @@ ostrzeżenia o konfiguracji JavaFX.
 - serwer przekazuje tylko osobne zaszyfrowane koperty klucza;
 - numer sekwencyjny pomaga odrzucać powtórzone lub stare pakiety;
 - zmiana składu pokoju powoduje utworzenie nowego klucza;
+- każdy klient lokalnie wylicza sześciocyfrowy SAS do porównania poza kanałem;
 - losowy `relayToken` ogranicza możliwość podszycia się podczas rejestracji UDP.
 
 ### Co widzi serwer
@@ -563,7 +586,8 @@ Serwer widzi metadane potrzebne do działania:
 - identyfikatory uczestników, epokę i rozmiary pakietów;
 - czas i częstotliwość przesyłania datagramów.
 
-Nie widzi klucza grupowego ani odszyfrowanej zawartości rozmowy.
+Nie widzi klucza grupowego ani odszyfrowanej zawartości rozmowy. Nie widzi
+także kodu SAS ani lokalnego statusu „zweryfikowano”.
 
 ### Zmiana klucza i odporność obsługi protokołu
 
@@ -578,17 +602,50 @@ lidera. Przy dołączaniu obowiązuje 10-sekundowy timeout bezczynności odczytu
 a pojedyncza ramka TCP może mieć do 16 KiB. Nie są to pełne mechanizmy
 ochrony przed przeciążeniem: prototyp nie ma limitu liczby sesji ani rate limitu.
 
-### Ważne ograniczenie: aktywny MITM
+### Weryfikacja klucza kodem SAS
 
-Klienci nie mają kont, certyfikatów ani wcześniej zaufanych kluczy. Obecna
-wersja nie potwierdza kryptograficznie tożsamości otrzymanego klucza publicznego.
-Złośliwy, aktywny serwer mógłby próbować podmienić klucze publiczne i wykonać
-atak man-in-the-middle.
+Klienci nadal nie mają kont, certyfikatów ani wcześniej zaufanych kluczy.
+Zamiast PKI każdy klient wylicza lokalnie sześciocyfrowy kod SAS:
 
-W pracy inżynierskiej należy jasno określić model jako ochronę przed pasywnym
-lub uczciwym, lecz ciekawskim serwerem. Wersja docelowa powinna dodać porównanie
-krótkiego kodu bezpieczeństwa (SAS), kod QR, podpisy lub inny mechanizm
-uwierzytelnienia uczestników.
+```text
+SAS = HKDF-SHA-256(
+          klucz_grupowy,
+          salt = "ciphervoice-sas/v1",
+          info = transkrypt
+      ) -> 8 bajtów -> mod 1 000 000 -> "482 913"
+```
+
+Transkrypt obejmuje wersję, nazwę pokoju, epokę, identyfikator lidera oraz
+wszystkich uczestników posortowanych po UUID. Każdy wpis zawiera `clientId`,
+nickname, publiczny klucz X25519 i `senderTag`; pola są poprzedzone długością,
+więc serializacja jest jednoznaczna. Klient dodatkowo sprawdza, że jego własny
+wpis ma jego klucz publiczny i `senderTag`; niezgodność oznacza brak SAS
+i komunikat o problemie.
+
+Kod pojawia się w nagłówku pokoju jako `SAS: 482 913`. Kliknięcie otwiera okno
+z dużym kodem i przyciskiem **„Oznacz jako zweryfikowany”**. Użytkownicy
+porównują kod poza CipherVoice, na przykład osobiście lub innym komunikatorem.
+Zgodność oznacza, że serwer nie podmienił kluczy; różnica oznacza możliwy atak
+MITM i powinna przerwać rozmowę.
+
+SAS i status weryfikacji nigdy nie są wysyłane przez serwer i nie zmieniają
+protokołu TCP/UDP. Status jest wyłącznie lokalny i jest związany z kodem oraz
+epoką: zmiana klucza, epoki, lidera lub składu pokoju automatycznie go resetuje.
+
+Ograniczenia:
+
+- ochronę daje dopiero faktyczne porównanie kodu; kliknięcie bez porównania
+  niczego nie wnosi;
+- sześć cyfr to około 20 bitów, czyli szansa przypadkowej zgodności około
+  1 na 1 000 000;
+- jest to jeden SAS dla całego pokoju, a nie osobny kod dla każdej pary jak
+  w ZRTP;
+- brak commit-reveal i trwałych kluczy tożsamości, więc prototyp nie daje
+  ciągłości zaufania między sesjami;
+- użytkownik, który nie sprawdzi kodu, nadal jest podatny na aktywnego MITM.
+
+Model bezpieczeństwa nadal nie jest certyfikacją: SAS wykrywa podmianę kluczy
+tylko wtedy, gdy ludzie rzeczywiście porównają wyświetlony kod.
 
 ## Obecne ograniczenia i dalszy rozwój
 
@@ -597,7 +654,8 @@ uwierzytelnienia uczestników.
 - brak automatycznego odnajdywania serwera w LAN;
 - brak NAT traversal; połączenie przez internet wymaga obecnie dostępnego serwera;
 - brak kont, ról, haseł do pokojów i list kontroli dostępu;
-- brak SAS/QR do ochrony przed aktywnym MITM;
+- SAS wymaga porównania kodu przez ludzi; brak commit-reveal i trwałych
+  tożsamości między sesjami;
 - brak instalatora `.exe` i automatycznych aktualizacji;
 - klientowy JAR zawiera natywne biblioteki JavaFX dla Windows x64.
 
@@ -605,7 +663,7 @@ Naturalna kolejność dalszych prac:
 
 1. adaptacyjny bufor jitter oraz lepsza kompensacja utraty pakietów;
 2. przełączanie mikrofonu i głośników w trakcie rozmowy;
-3. SAS lub QR do weryfikacji kluczy;
+3. commit-reveal oraz trwałe klucze tożsamości dla SAS;
 4. serwer dostępny przez internet;
 5. instalator Windows przez `jpackage`;
 6. pomiary opóźnienia, strat pakietów i jakości dźwięku do pracy inżynierskiej.
